@@ -8,6 +8,7 @@
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.0+-3178C6?style=flat&logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
 [![Vite](https://img.shields.io/badge/Vite-8.2-646CFF?style=flat&logo=vite&logoColor=white)](https://vitejs.dev/)
 [![Dataset](https://img.shields.io/badge/Dataset-AICity_2021_Track_1-orange?style=flat)](https://www.aicitychallenge.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 **TrafficTwin** is an end-to-end intelligent traffic perception and digital twin platform built for automated multi-class vehicle detection, multi-movement tracking, trajectory analysis, and real-time intersection congestion intelligence. Developed around the **AI City Challenge 2021 (AIC21) Track 1 Benchmark**, TrafficTwin turns surveillance video feeds into actionable smart-city telemetry, adaptive signal insights, and interactive dashboards.
 
@@ -275,5 +276,7 @@ intelligence:
 
 ## 📄 License & Acknowledgments
 
+This project is licensed under the **MIT License** — see the [LICENSE](file:///d:/openhack/LICENSE) file for details.
+
 - Built using the **AI City Challenge 2021 Track 1 Dataset** for research and intelligent transportation benchmarking.
-- Powered by [Ultralytics YOLOv8](https://github.com/ultralytics/ultralytics), [FastAPI](https://fastapi.tiangolo.com/), and [React](https://react.dev/).
+- Powered by [Ultralytics YOLOv8](https://github.com/ultralytics/ultralytics), [PyTorch](https://pytorch.org/), [FastAPI](https://fastapi.tiangolo.com/), and [React](https://react.dev/).
