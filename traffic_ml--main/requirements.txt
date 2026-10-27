@@ -29,10 +29,9 @@ matplotlib>=3.10.8
 seaborn>=0.13.2
 tqdm>=4.67.3
 
-# API (install if building FastAPI endpoint)
-# fastapi>=0.115.0
-# uvicorn[standard]>=0.30.0
-uvicorn
+# API
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
 
 # Utilities
 psutil>=7.2.2
