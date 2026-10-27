@@ -71,16 +71,11 @@ traffic_ml/outputs/videos/*
 Thumbs.db
 .idea/
 .vscode/
-
-traffic_ml--main/.git-backup/
-
-traffic_ml--main/.git-backup/
+<<<<<<< HEAD
 
 # Local uploaded videos and generated output
 traffic_ml--main/data/uploads/
 traffic_ml--main/outputs/videos/
-
-# Local processing data
 jobs/
 traffic_ml/
 
@@ -96,3 +91,7 @@ traffic_ml--main/web/dist/
 
 # Local environment secrets
 traffic_ml--main/web/.env.local
+
+# Git backup metadata
+traffic_ml--main/.git-backup/
+>>>>>>> origin/main
