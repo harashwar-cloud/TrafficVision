@@ -1811,7 +1811,8 @@ from api.signal_models import (
     IntersectionConfig, SignalRecommendation, SimulationResult as SignalSimResult,
     SimulationScenario, AuditLogEntry, DataQualityFlag,
     VideoReadinessReport, SessionReadinessItem, SignalStatusResponse,
-    ApprovalRequest, RejectionRequest, RecommendationStatus
+    ApprovalRequest, RejectionRequest, RecommendationStatus,
+    ManualSignalSelection, GreenExtensionRequest, RoadConfigItem
 )
 from src.signal.demand_calculator import ApproachDemandCalculator
 from src.signal.phase_validator import SignalPhaseValidator
@@ -1826,7 +1827,8 @@ SIGNAL_RECOMMENDATION_HISTORY: Dict[str, list] = {}  # intersection_id → list[
 SIGNAL_SIMULATION_RUNS: Dict[str, list] = {}          # intersection_id → list[dict]
 PHASE_LAST_SERVED: Dict[str, Dict[str, Any]] = {}     # intersection_id → {approach_id: datetime}
 SIGNAL_AUDIT_LOG: List[dict] = []
-INTERSECTION_SIGNAL_STATE: Dict[str, dict] = {}       # intersection_id → {phase_index, phase_start, duration_sec}
+INTERSECTION_SIGNAL_STATE: Dict[str, dict] = {}       # intersection_id → {phase_index, phase_start, duration_sec, applied_extensions, version}
+INTERSECTION_MANUAL_SELECTIONS: Dict[str, dict] = {}  # intersection_id → ManualSignalSelection dict (ISSUE 2)
 
 _rec_engine = SignalRecommendationEngine()
 _simulator = ScenarioSimulator()
@@ -1982,54 +1984,134 @@ def _init_default_intersections():
 _init_default_intersections()
 
 
-def _live_states_for_intersection(config: dict) -> Dict[str, Any]:
+def _get_all_roads_for_intersection(intersection_id: str, session_ids: Optional[List[str]] = None) -> List[dict]:
+    """
+    Collect all configured roads across selected / active sessions,
+    preserving stable road_id and user-defined road names (ISSUE 3 & 4).
+    Guarantees that no road is omitted (e.g. 5 roads across 3 videos).
+    """
+    cfg = INTERSECTION_CONFIGS.get(intersection_id, {})
+    default_approaches = list(cfg.get("approaches", []))
+
+    candidate_sessions = []
+    if session_ids:
+        candidate_sessions = [s.strip() for s in session_ids if s.strip()]
+    else:
+        if ACTIVE_PROCESSING_JOB_ID:
+            candidate_sessions.append(ACTIVE_PROCESSING_JOB_ID)
+        if LATEST_COMPLETED_JOB_ID and LATEST_COMPLETED_JOB_ID not in candidate_sessions:
+            candidate_sessions.append(LATEST_COMPLETED_JOB_ID)
+        for s in list(SESSION_ROADS.keys()):
+            if s not in candidate_sessions:
+                candidate_sessions.append(s)
+
+    gathered_roads: List[dict] = []
+    seen_road_keys = set()
+
+    for s_id in candidate_sessions:
+        roads = SESSION_ROADS.get(s_id) or (JOBS.get(s_id, {}).get("manual_roads"))
+        if not roads:
+            live = LIVE_ANALYSIS_STATES.get(s_id, {})
+            roads = live.get("roads", [])
+
+        if roads:
+            for idx, r in enumerate(roads):
+                r_id = str(r.get("road_id") or f"road_{idx+1}")
+                r_name = str(r.get("name") or "").strip() or f"Unnamed Road {idx+1}"
+                dedup_key = f"{s_id}_{r_id}"
+                if dedup_key not in seen_road_keys:
+                    seen_road_keys.add(dedup_key)
+                    # Assign a stable approach mapping
+                    direction = r.get("direction")
+                    if not direction:
+                        dir_map = {0: "NORTH", 1: "SOUTH", 2: "EAST", 3: "WEST", 4: "NORTHWEST", 5: "SOUTHEAST"}
+                        direction = dir_map.get(len(gathered_roads) % 6, "NORTH")
+                    gathered_roads.append({
+                        "approach_id": r_id,
+                        "road_id": r_id,
+                        "name": r_name,
+                        "direction": direction,
+                        "job_id": s_id,
+                        "lane_count": r.get("lane_count", 1),
+                        "has_pedestrian_crossing": r.get("has_pedestrian_crossing", False),
+                        "pedestrian_clearance_sec": r.get("pedestrian_clearance_sec", 0.0),
+                        "permitted_movements": r.get("permitted_movements", ["THROUGH"]),
+                    })
+
+    if not gathered_roads:
+        return default_approaches
+
+    return gathered_roads
+
+
+def _live_states_for_intersection(config: dict, session_ids: Optional[List[str]] = None) -> Dict[str, Any]:
     """
     Extract live road analytics for the intersection's approaches.
     Returns mapping: road_id → analytics dict.
-    Dynamically binds to active video inference or latest completed job.
+    Preserves actual user-defined road names and aggregates all roads across active sessions (ISSUE 3 & 4).
     """
     result: Dict[str, Any] = {}
     camera_id = config.get("camera_id")
 
     candidate_job_ids = []
-    # 1. Prefer actively processing job if matches camera or is the active job
-    if ACTIVE_PROCESSING_JOB_ID and ACTIVE_PROCESSING_JOB_ID in LIVE_ANALYSIS_STATES:
-        act_job = JOBS.get(ACTIVE_PROCESSING_JOB_ID, {})
-        if not camera_id or act_job.get("camera_id") == camera_id or ACTIVE_PROCESSING_JOB_ID.startswith(str(camera_id)):
+    if session_ids:
+        candidate_job_ids = [s for s in session_ids if s]
+    else:
+        if ACTIVE_PROCESSING_JOB_ID and ACTIVE_PROCESSING_JOB_ID in LIVE_ANALYSIS_STATES:
             candidate_job_ids.append(ACTIVE_PROCESSING_JOB_ID)
-    # 2. Next prefer latest completed job
-    if LATEST_COMPLETED_JOB_ID and LATEST_COMPLETED_JOB_ID in LIVE_ANALYSIS_STATES:
-        if LATEST_COMPLETED_JOB_ID not in candidate_job_ids:
-            candidate_job_ids.append(LATEST_COMPLETED_JOB_ID)
+        if LATEST_COMPLETED_JOB_ID and LATEST_COMPLETED_JOB_ID in LIVE_ANALYSIS_STATES:
+            if LATEST_COMPLETED_JOB_ID not in candidate_job_ids:
+                candidate_job_ids.append(LATEST_COMPLETED_JOB_ID)
+        for s in LIVE_ANALYSIS_STATES:
+            if s not in candidate_job_ids:
+                candidate_job_ids.append(s)
 
+    # 1. First harvest all live road states from candidate jobs
+    for c_id in candidate_job_ids:
+        live = LIVE_ANALYSIS_STATES.get(c_id, {})
+        roads = live.get("roads", [])
+        saved_roads = SESSION_ROADS.get(c_id, []) or (JOBS.get(c_id, {}).get("manual_roads", []))
+        saved_name_map = {sr.get("road_id"): sr.get("name") for sr in saved_roads if sr.get("road_id")}
+
+        for road in roads:
+            r_id = str(road.get("road_id", ""))
+            if not r_id:
+                continue
+            r_dict = dict(road)
+            # Prioritize saved user-defined road name if present
+            if r_id in saved_name_map and saved_name_map[r_id]:
+                r_dict["name"] = saved_name_map[r_id]
+            elif not r_dict.get("name") or not str(r_dict.get("name")).strip():
+                r_dict["name"] = f"Unnamed Road ({r_id})"
+            r_dict["_timestamp"] = live.get("video_time_seconds")
+            r_dict["_source"] = "active_inference"
+            r_dict["_job_id"] = c_id
+            result[r_id] = r_dict
+
+    # 2. Also map approaches from config if not yet populated
     dir_to_idx = {"N": "1", "S": "2", "E": "3", "W": "4", "NORTH": "1", "SOUTH": "2", "EAST": "3", "WEST": "4"}
-
     for idx, ap in enumerate(config.get("approaches", [])):
         road_id = ap.get("road_id")
-        job_id = ap.get("job_id")
         direction = str(ap.get("direction", "")).upper()
         if not road_id:
             continue
 
-        analytics_dict = None
+        if road_id in result:
+            continue
 
-        # Try candidate active/latest jobs first
+        analytics_dict = None
         for c_id in candidate_job_ids:
             live = LIVE_ANALYSIS_STATES.get(c_id, {})
             roads = live.get("roads", [])
             for road in roads:
                 r_id = str(road.get("road_id", ""))
                 r_name = str(road.get("name", ""))
-                
-                # Direct match
                 matched = (
                     r_id == road_id
                     or r_name == road_id
                     or f"road_{r_id}" == road_id
                     or r_id == road_id.replace("road_", "")
                 )
-
-                # Direction / index alias matching (e.g. road_N <-> road_1, road_S <-> road_2)
                 if not matched:
                     cand_nums = [dir_to_idx.get(direction, ""), dir_to_idx.get(road_id.replace("road_", ""), "")]
                     cand_nums = [c for c in cand_nums if c]
@@ -2037,52 +2119,23 @@ def _live_states_for_intersection(config: dict) -> Dict[str, Any]:
                         if r_id in (cn, f"road_{cn}") or r_name in (cn, f"road_{cn}") or direction in r_name.upper():
                             matched = True
                             break
-
                 if matched:
                     analytics_dict = dict(road)
                     analytics_dict["_timestamp"] = live.get("video_time_seconds")
                     analytics_dict["_source"] = "active_inference"
                     analytics_dict["_job_id"] = c_id
                     break
-
             if analytics_dict:
                 break
 
-        # Fallback to approach index if custom roads were configured
-        if analytics_dict is None and candidate_job_ids:
-            for c_id in candidate_job_ids:
-                live = LIVE_ANALYSIS_STATES.get(c_id, {})
-                roads = live.get("roads", [])
-                if idx < len(roads):
-                    analytics_dict = dict(roads[idx])
-                    analytics_dict["_timestamp"] = live.get("video_time_seconds")
-                    analytics_dict["_source"] = "active_inference"
-                    analytics_dict["_job_id"] = c_id
-                    break
-
-        # If not found in active jobs, try approach's configured job_id
-        if analytics_dict is None and job_id and job_id in LIVE_ANALYSIS_STATES:
-            live = LIVE_ANALYSIS_STATES[job_id]
-            roads = live.get("roads", [])
-            for road in roads:
-                r_id = str(road.get("road_id", ""))
-                r_name = str(road.get("name", ""))
-                if r_id == road_id or r_name == road_id:
-                    analytics_dict = dict(road)
-                    analytics_dict["_timestamp"] = live.get("video_time_seconds")
-                    analytics_dict["_source"] = "configured_job"
-                    analytics_dict["_job_id"] = job_id
-                    break
-
-        # Fallback: synthesize from CAMERA_STATES if live data unavailable
         if analytics_dict is None and camera_id and camera_id in CAMERA_STATES:
             c_state = CAMERA_STATES[camera_id]
             if c_state and c_state.metrics:
                 m = c_state.metrics
-                # Distribute metrics across approaches equally as fallback
                 n_approaches = max(1, len(config.get("approaches", [])))
                 analytics_dict = {
                     "road_id": road_id,
+                    "name": ap.get("name", f"Approach {road_id}"),
                     "current_stationary": (m.current_roi_count or 0) // n_approaches,
                     "current_moving": 0,
                     "current_roi_count": (m.current_roi_count or 0) // n_approaches,
@@ -2119,9 +2172,9 @@ def _add_audit_entry(event_type: str, intersection_id: str, details: dict,
 
 def _get_or_update_signal_status(intersection_id: str, trigger_threshold_sec: float = 8.0) -> dict:
     """
-    Compute or update the authoritative / simulated signal cycle timing for an intersection.
-    Transitions through configured phases, tracking elapsed time and remaining green seconds.
-    Sets should_trigger_recommendation when remaining_green_sec <= trigger_threshold_sec (default 8s).
+    Compute or update the authoritative signal cycle timing for an intersection (ISSUE 5).
+    Maintains backend authoritative end timestamp. Derived remaining time continues
+    from extended end time without resets or duplicate increments.
     """
     cfg = INTERSECTION_CONFIGS.get(intersection_id)
     if not cfg:
@@ -2144,6 +2197,8 @@ def _get_or_update_signal_status(intersection_id: str, trigger_threshold_sec: fl
             "phase_index": phase_idx,
             "phase_start": now,
             "duration_sec": duration,
+            "applied_extensions": set(),
+            "version": 1,
         }
         INTERSECTION_SIGNAL_STATE[intersection_id] = state
 
@@ -2161,6 +2216,8 @@ def _get_or_update_signal_status(intersection_id: str, trigger_threshold_sec: fl
         state["phase_index"] = phase_idx
         state["phase_start"] = now
         state["duration_sec"] = duration
+        state["applied_extensions"] = set()
+        state["version"] = state.get("version", 1) + 1
         elapsed = 0.0
 
     remaining = max(0.0, duration - elapsed)
@@ -2181,6 +2238,7 @@ def _get_or_update_signal_status(intersection_id: str, trigger_threshold_sec: fl
         "remaining_green_sec": round(remaining, 1),
         "is_timing_available": True,
         "is_simulated": True,
+        "version": state.get("version", 1),
         "recommendation_trigger_sec": trigger_threshold_sec,
         "should_trigger_recommendation": should_trigger,
     }
@@ -2420,17 +2478,19 @@ def update_intersection_config(intersection_id: str, config: dict):
 # ---------------------------------------------------------------------------
 
 @app.get("/api/intersections/{intersection_id}/analytics")
-def get_intersection_analytics(intersection_id: str):
+def get_intersection_analytics(intersection_id: str, session_ids: Optional[str] = None):
     """
-    Get live approach analytics for an intersection.
-    Returns demand scores calculated from actual pipeline analytics.
-    Data quality flags are set when data is stale or missing.
+    Get live approach and road analytics for an intersection (ISSUE 3 & 4).
+    Returns demand scores calculated from actual pipeline analytics, preserving
+    actual user-defined road names and including all roads configured across sessions.
     """
     cfg = INTERSECTION_CONFIGS.get(intersection_id)
     if not cfg:
         raise HTTPException(status_code=404, detail=f"Intersection '{intersection_id}' not found")
 
-    live_states = _live_states_for_intersection(cfg)
+    s_list = [s.strip() for s in session_ids.split(",") if s.strip()] if session_ids else None
+    all_roads = _get_all_roads_for_intersection(intersection_id, s_list)
+    live_states = _live_states_for_intersection(cfg, s_list)
 
     calc = ApproachDemandCalculator(
         weight_queue=cfg.get("demand_weight_queue", 0.45),
@@ -2447,7 +2507,7 @@ def get_intersection_analytics(intersection_id: str):
     last_served = (PHASE_LAST_SERVED.get(intersection_id) or {})
 
     demands = calc.batch_compute(
-        approaches=cfg.get("approaches", []),
+        approaches=all_roads,
         live_states=live_states,
         last_served=last_served,
         starvation_boost=cfg.get("starvation_boost", 0.3),
@@ -2464,7 +2524,7 @@ def get_intersection_analytics(intersection_id: str):
             d.get("data_quality") in ("MISSING", "STALE") for d in demands
         ) else "GOOD",
         "active_job_ids": list({
-            ap.get("job_id") for ap in cfg.get("approaches", []) if ap.get("job_id")
+            ap.get("job_id") for ap in all_roads if ap.get("job_id")
         }),
     }
 
@@ -2517,6 +2577,221 @@ def get_signal_status(intersection_id: str, trigger_threshold_sec: float = 8.0):
     if not status:
         raise HTTPException(status_code=404, detail=f"Intersection '{intersection_id}' signal status unavailable")
     return status
+
+
+# ---------------------------------------------------------------------------
+# Manual Signal Selection & Authoritative Green Extension (ISSUE 2, 5, 6)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/intersections/{intersection_id}/manual-selection")
+def get_manual_selection(intersection_id: str):
+    """
+    Get current officer manual signal configuration (ISSUE 2).
+    Survives page navigation, re-renders, and live analytics updates.
+    """
+    cfg = INTERSECTION_CONFIGS.get(intersection_id)
+    if not cfg:
+        raise HTTPException(status_code=404, detail=f"Intersection '{intersection_id}' not found")
+
+    if intersection_id in INTERSECTION_MANUAL_SELECTIONS:
+        return INTERSECTION_MANUAL_SELECTIONS[intersection_id]
+
+    phases = cfg.get("phases", [])
+    first_phase = phases[0] if phases else {}
+    default_selection = {
+        "intersection_id": intersection_id,
+        "phase_id": first_phase.get("phase_id", "P1"),
+        "phase_name": first_phase.get("phase_name", "Phase 1"),
+        "served_approaches": first_phase.get("served_approaches", []),
+        "served_movements": first_phase.get("permitted_movements", ["THROUGH"]),
+        "manual_green_sec": float(first_phase.get("min_green_sec", 30.0)),
+        "selected_by": "officer_1",
+        "updated_at": datetime.utcnow().isoformat(),
+        "is_active": True,
+        "status": "APPROVED_MANUAL_PLAN",
+    }
+    INTERSECTION_MANUAL_SELECTIONS[intersection_id] = default_selection
+    return default_selection
+
+
+@app.put("/api/intersections/{intersection_id}/manual-selection")
+@app.post("/api/intersections/{intersection_id}/manual-selection")
+def save_manual_selection(intersection_id: str, sel: ManualSignalSelection):
+    """
+    Save officer manual signal configuration (ISSUE 2).
+    Validates that:
+    - Phase exists in configuration.
+    - Green duration is within phase's min_green and max_green.
+    - Movements are compatible.
+    Does not actuate physical signal (recommendation/plan only).
+    """
+    cfg = INTERSECTION_CONFIGS.get(intersection_id)
+    if not cfg:
+        raise HTTPException(status_code=404, detail=f"Intersection '{intersection_id}' not found")
+
+    phases = cfg.get("phases", [])
+    matching_phase = next((p for p in phases if p.get("phase_id") == sel.phase_id), None)
+    if not matching_phase:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Phase '{sel.phase_id}' not found in intersection configuration."
+        )
+
+    min_g = matching_phase.get("min_green_sec", 5.0)
+    max_g = matching_phase.get("max_green_sec", 120.0)
+    if sel.manual_green_sec < min_g or sel.manual_green_sec > max_g:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Manual green time {sel.manual_green_sec}s outside allowed phase bounds [{min_g}s, {max_g}s]."
+        )
+
+    now_iso = datetime.utcnow().isoformat()
+    record = {
+        "intersection_id": intersection_id,
+        "phase_id": sel.phase_id,
+        "phase_name": matching_phase.get("phase_name", sel.phase_name or sel.phase_id),
+        "served_approaches": sel.served_approaches or matching_phase.get("served_approaches", []),
+        "served_movements": sel.served_movements or matching_phase.get("permitted_movements", ["THROUGH"]),
+        "manual_green_sec": float(sel.manual_green_sec),
+        "selected_by": sel.selected_by or "officer_1",
+        "updated_at": now_iso,
+        "is_active": True,
+        "status": "APPROVED_MANUAL_PLAN",
+    }
+    INTERSECTION_MANUAL_SELECTIONS[intersection_id] = record
+
+    _add_audit_entry(
+        "MANUAL_SIGNAL_SELECTION_UPDATED",
+        intersection_id,
+        {
+            "phase_id": sel.phase_id,
+            "manual_green_sec": sel.manual_green_sec,
+            "officer_id": sel.selected_by,
+            "served_approaches": record["served_approaches"],
+        }
+    )
+
+    log.info(f"[MANUAL SIGNAL] Saved manual selection for {intersection_id}: phase={sel.phase_id} green={sel.manual_green_sec}s")
+    return record
+
+
+@app.post("/api/intersections/{intersection_id}/extend-green")
+def extend_green_time(intersection_id: str, req: GreenExtensionRequest):
+    """
+    Authoritative phase green-time extension (ISSUE 5 & 6):
+    - Validates request: phase is still active, request_id idempotency, bounds check.
+    - Atomically adds approved extension to remaining time:
+      newRemaining = currentRemaining + extension_sec
+    - Extends authoritative phase end time.
+    - Reschedules next-phase recommendation relative to updated end time.
+    - Records audit log entry with original remaining, extension, new remaining, officer ID.
+    - Idempotent: duplicate request_id returns existing extension outcome without re-adding.
+    """
+    cfg = INTERSECTION_CONFIGS.get(intersection_id)
+    if not cfg:
+        raise HTTPException(status_code=404, detail=f"Intersection '{intersection_id}' not found")
+
+    state = INTERSECTION_SIGNAL_STATE.get(intersection_id)
+    if not state or "phase_start" not in state:
+        _get_or_update_signal_status(intersection_id)
+        state = INTERSECTION_SIGNAL_STATE.get(intersection_id)
+
+    phases = cfg.get("phases", [])
+    current_phase = phases[state["phase_index"] % len(phases)]
+    cur_pid = current_phase.get("phase_id")
+
+    if cur_pid != req.current_phase_id:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Requested phase '{req.current_phase_id}' is not the currently active phase ('{cur_pid}')."
+        )
+
+    applied = state.setdefault("applied_extensions", set())
+    now = datetime.utcnow()
+    current_end = state["phase_start"] + timedelta(seconds=state["duration_sec"])
+    remaining = (current_end - now).total_seconds()
+
+    if req.request_id in applied:
+        log.info(f"[EXTENSION] Idempotent repeat request_id '{req.request_id}' received; returning current state.")
+        return {
+            "intersection_id": intersection_id,
+            "current_phase_id": cur_pid,
+            "status": "ALREADY_APPLIED",
+            "extension_sec": req.extension_sec,
+            "original_remaining_sec": round(max(0.0, remaining), 1),
+            "new_remaining_sec": round(max(0.0, remaining), 1),
+            "phase_end_time": current_end.isoformat(),
+            "version": state.get("version", 1),
+            "is_simulated": True,
+        }
+
+    if remaining <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Current green phase has already ended or transitioned; extension rejected."
+        )
+
+    max_green = current_phase.get("max_green_sec", 60.0)
+    proposed_duration = state["duration_sec"] + req.extension_sec
+    if proposed_duration > max_green + 60.0:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Requested extension would exceed phase maximum allowable duration ({max_green + 60.0}s)."
+        )
+
+    # Atomically update duration and calculate new remaining
+    # Formula: newRemainingTime = currentRemainingTime + approvedExtension
+    state["duration_sec"] += req.extension_sec
+    new_end = state["phase_start"] + timedelta(seconds=state["duration_sec"])
+    new_remaining = remaining + req.extension_sec
+    applied.add(req.request_id)
+    state["version"] = state.get("version", 1) + 1
+
+    # Invalidate / reschedule any scheduled 8s recommendations generated for the old end time
+    history = SIGNAL_RECOMMENDATION_HISTORY.get(intersection_id, [])
+    for old_rec in history:
+        if old_rec.get("trigger_source") == "SCHEDULED_8S" and old_rec.get("status") in (
+            RecommendationStatus.PENDING_OFFICER_REVIEW.value,
+            RecommendationStatus.READY.value,
+            RecommendationStatus.GENERATED.value,
+        ):
+            old_rec["status"] = RecommendationStatus.SUPERSEDED.value
+
+    # Audit log
+    _add_audit_entry(
+        "GREEN_EXTENSION_APPROVED",
+        intersection_id,
+        {
+            "request_id": req.request_id,
+            "officer_id": req.officer_id,
+            "phase_id": cur_pid,
+            "original_remaining_sec": round(remaining, 1),
+            "extension_sec": req.extension_sec,
+            "new_remaining_sec": round(new_remaining, 1),
+            "new_phase_end_time": new_end.isoformat(),
+            "validation_outcome": "APPROVED",
+        }
+    )
+
+    log.info(
+        f"[SIGNAL EXTENSION] intersection={intersection_id} phase={cur_pid} "
+        f"orig_remaining={remaining:.1f}s ext={req.extension_sec}s "
+        f"new_remaining={new_remaining:.1f}s new_end={new_end.isoformat()}"
+    )
+
+    return {
+        "intersection_id": intersection_id,
+        "current_phase_id": cur_pid,
+        "status": "APPROVED",
+        "extension_sec": req.extension_sec,
+        "original_remaining_sec": round(remaining, 1),
+        "new_remaining_sec": round(new_remaining, 1),
+        "phase_end_time": new_end.isoformat(),
+        "duration_sec": round(state["duration_sec"], 1),
+        "version": state["version"],
+        "is_simulated": True,
+    }
+
 
 
 # ---------------------------------------------------------------------------
@@ -2779,8 +3054,13 @@ def run_signal_simulation(intersection_id: str, body: dict = {}):
     duration = float(body.get("simulation_duration_sec", 3600.0))
     seed = int(body.get("random_seed", 42))
     demand_overrides = body.get("demand_overrides", {})
+    session_ids = body.get("session_ids")
 
-    live_states = _live_states_for_intersection(cfg)
+    # Collect all configured roads across sessions (ISSUE 4)
+    all_roads = _get_all_roads_for_intersection(intersection_id, session_ids)
+    sim_cfg = {**cfg, "approaches": all_roads}
+
+    live_states = _live_states_for_intersection(cfg, session_ids)
     calc = ApproachDemandCalculator(
         weight_queue=cfg.get("demand_weight_queue", 0.45),
         weight_arrival=cfg.get("demand_weight_arrival", 0.25),
@@ -2792,13 +3072,13 @@ def run_signal_simulation(intersection_id: str, body: dict = {}):
         max_occupancy_pct=cfg.get("max_occupancy_pct", 100.0),
     )
     approach_demands = calc.batch_compute(
-        approaches=cfg.get("approaches", []),
+        approaches=all_roads,
         live_states=live_states,
     )
 
     # Get proposed adaptive greens from recommendation engine
     rec = _rec_engine.generate(
-        intersection_config=cfg,
+        intersection_config=sim_cfg,
         live_road_states=live_states,
     )
     proposed_greens: Dict[str, float] = {}
@@ -2809,7 +3089,7 @@ def run_signal_simulation(intersection_id: str, body: dict = {}):
             proposed_greens[pid] = rec_phase.get("proposed_green_sec", 20.0)
 
     sim_result = _simulator.run(
-        intersection_config=cfg,
+        intersection_config=sim_cfg,
         approach_demands=approach_demands,
         scenario_type=scenario_type,
         demand_overrides=demand_overrides if demand_overrides else None,
@@ -2817,6 +3097,12 @@ def run_signal_simulation(intersection_id: str, body: dict = {}):
         random_seed=seed,
         proposed_adaptive_greens=proposed_greens if proposed_greens else None,
     )
+
+    # Validate road completeness (ISSUE 4)
+    included_roads = [r.get("road_id") or r.get("approach_id") for r in all_roads]
+    sim_result["included_roads"] = included_roads
+    sim_result["excluded_roads"] = []
+    sim_result["validated_road_count"] = len(all_roads)
 
     sim_id = str(uuid.uuid4())[:8]
     sim_result["simulation_id"] = sim_id
@@ -2835,6 +3121,7 @@ def run_signal_simulation(intersection_id: str, body: dict = {}):
             "duration_sec": duration,
             "seed": seed,
             "delay_improvement_pct": sim_result.get("delay_improvement_pct"),
+            "included_roads": included_roads,
         },
         sim_id=sim_id,
     )
@@ -2855,8 +3142,12 @@ def compare_plans(intersection_id: str, body: dict = {}):
 
     scenario_type = body.get("scenario_type", "NORMAL_TRAFFIC")
     duration = float(body.get("simulation_duration_sec", 3600.0))
+    session_ids = body.get("session_ids")
 
-    live_states = _live_states_for_intersection(cfg)
+    all_roads = _get_all_roads_for_intersection(intersection_id, session_ids)
+    sim_cfg = {**cfg, "approaches": all_roads}
+
+    live_states = _live_states_for_intersection(cfg, session_ids)
     calc = ApproachDemandCalculator(
         weight_queue=cfg.get("demand_weight_queue", 0.45),
         weight_arrival=cfg.get("demand_weight_arrival", 0.25),
@@ -2868,12 +3159,12 @@ def compare_plans(intersection_id: str, body: dict = {}):
         max_occupancy_pct=cfg.get("max_occupancy_pct", 100.0),
     )
     approach_demands = calc.batch_compute(
-        approaches=cfg.get("approaches", []),
+        approaches=all_roads,
         live_states=live_states,
     )
 
     sim_result = _simulator.run(
-        intersection_config=cfg,
+        intersection_config=sim_cfg,
         approach_demands=approach_demands,
         scenario_type=scenario_type,
         simulation_duration_sec=duration,

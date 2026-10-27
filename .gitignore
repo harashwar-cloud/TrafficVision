@@ -71,3 +71,7 @@ traffic_ml/outputs/videos/*
 Thumbs.db
 .idea/
 .vscode/
+
+traffic_ml--main/.git-backup/
+
+traffic_ml--main/.git-backup/
