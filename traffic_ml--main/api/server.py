@@ -1309,7 +1309,7 @@ def save_session_roads(job_id: str, roads: List[dict]):
     Guarantees stable roadId and persists actual user road names (e.g. 'Avinashi Road').
     """
     if job_id not in JOBS and not (project_root.parent / "AIC21_Track1_Vehicle_Counting" / "Dataset_A" / f"{job_id}.mp4").exists():
-        raise HTTPException(status_code=404, detail=f"Session {job_id} not found")
+        JOBS[job_id] = {"job_id": job_id, "status": "READY", "video_name": f"{job_id}.mp4"}
 
     normalized = []
     for idx, r in enumerate(roads):
@@ -3033,7 +3033,7 @@ def get_recommendation_history(intersection_id: str, limit: int = 20):
 # ---------------------------------------------------------------------------
 
 @app.post("/api/intersections/{intersection_id}/simulate")
-def run_signal_simulation(intersection_id: str, body: dict = {}):
+def run_signal_simulation(intersection_id: str, body: dict = {}, session_ids: Optional[str] = None):
     """
     Run an analytical scenario simulation comparing adaptive vs fixed-time plans.
 
@@ -3054,13 +3054,14 @@ def run_signal_simulation(intersection_id: str, body: dict = {}):
     duration = float(body.get("simulation_duration_sec", 3600.0))
     seed = int(body.get("random_seed", 42))
     demand_overrides = body.get("demand_overrides", {})
-    session_ids = body.get("session_ids")
+    raw_s = session_ids or body.get("session_ids")
+    s_list = [s.strip() for s in raw_s.split(",") if s.strip()] if isinstance(raw_s, str) else (raw_s if isinstance(raw_s, list) else None)
 
     # Collect all configured roads across sessions (ISSUE 4)
-    all_roads = _get_all_roads_for_intersection(intersection_id, session_ids)
+    all_roads = _get_all_roads_for_intersection(intersection_id, s_list)
     sim_cfg = {**cfg, "approaches": all_roads}
 
-    live_states = _live_states_for_intersection(cfg, session_ids)
+    live_states = _live_states_for_intersection(cfg, s_list)
     calc = ApproachDemandCalculator(
         weight_queue=cfg.get("demand_weight_queue", 0.45),
         weight_arrival=cfg.get("demand_weight_arrival", 0.25),
@@ -3130,7 +3131,7 @@ def run_signal_simulation(intersection_id: str, body: dict = {}):
 
 
 @app.post("/api/intersections/{intersection_id}/compare-plans")
-def compare_plans(intersection_id: str, body: dict = {}):
+def compare_plans(intersection_id: str, body: dict = {}, session_ids: Optional[str] = None):
     """
     Compare fixed-time baseline against adaptive plan side-by-side.
     Uses the same analytical simulator as /simulate but returns
@@ -3142,12 +3143,13 @@ def compare_plans(intersection_id: str, body: dict = {}):
 
     scenario_type = body.get("scenario_type", "NORMAL_TRAFFIC")
     duration = float(body.get("simulation_duration_sec", 3600.0))
-    session_ids = body.get("session_ids")
+    raw_s = session_ids or body.get("session_ids")
+    s_list = [s.strip() for s in raw_s.split(",") if s.strip()] if isinstance(raw_s, str) else (raw_s if isinstance(raw_s, list) else None)
 
-    all_roads = _get_all_roads_for_intersection(intersection_id, session_ids)
+    all_roads = _get_all_roads_for_intersection(intersection_id, s_list)
     sim_cfg = {**cfg, "approaches": all_roads}
 
-    live_states = _live_states_for_intersection(cfg, session_ids)
+    live_states = _live_states_for_intersection(cfg, s_list)
     calc = ApproachDemandCalculator(
         weight_queue=cfg.get("demand_weight_queue", 0.45),
         weight_arrival=cfg.get("demand_weight_arrival", 0.25),

@@ -525,24 +525,43 @@ class AuditLogEntry(BaseModel):
 class ManualSignalSelection(BaseModel):
     """Manual signal configuration saved by an officer (ISSUE 2)."""
     intersection_id: str
-    phase_id: str
+    selected_phase_id: Optional[str] = None
+    phase_id: Optional[str] = None
     phase_name: Optional[str] = None
     served_approaches: List[str] = Field(default_factory=list)
     served_movements: List[str] = Field(default_factory=list)
-    manual_green_sec: float = Field(30.0, ge=5.0, le=120.0)
-    selected_by: str = "officer_1"
+    proposed_green_sec: Optional[float] = None
+    manual_green_sec: Optional[float] = None
+    officer_id: str = "officer_1"
+    selected_by: Optional[str] = None
     updated_at: Optional[str] = None
+    created_at: Optional[str] = None
     is_active: bool = True
-    status: str = "APPROVED_MANUAL_PLAN"
+    status: str = "APPROVED_PLAN"
+    note: Optional[str] = None
+
+    def model_post_init(self, __context: Any) -> None:
+        if self.selected_phase_id is None and self.phase_id is not None:
+            self.selected_phase_id = self.phase_id
+        elif self.phase_id is None and self.selected_phase_id is not None:
+            self.phase_id = self.selected_phase_id
+
+        if self.proposed_green_sec is None and self.manual_green_sec is not None:
+            self.proposed_green_sec = self.manual_green_sec
+        elif self.manual_green_sec is None and self.proposed_green_sec is not None:
+            self.manual_green_sec = self.proposed_green_sec
 
 
 class GreenExtensionRequest(BaseModel):
     """Authoritative phase green-time extension request (ISSUE 5 & 6)."""
+    intersection_id: Optional[str] = None
     current_phase_id: str
     extension_sec: float = Field(..., gt=0.0, le=60.0)
     request_id: str
     officer_id: str = "officer_1"
     expected_end_time: Optional[str] = None
+    expected_phase_end_time: Optional[str] = None
+    recommendation_id: Optional[str] = None
 
 
 class RoadConfigItem(BaseModel):
