@@ -75,3 +75,24 @@ Thumbs.db
 traffic_ml--main/.git-backup/
 
 traffic_ml--main/.git-backup/
+
+# Local uploaded videos and generated output
+traffic_ml--main/data/uploads/
+traffic_ml--main/outputs/videos/
+
+# Local processing data
+jobs/
+traffic_ml/
+
+# Python cache and environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Frontend dependencies and builds
+traffic_ml--main/web/node_modules/
+traffic_ml--main/web/dist/
+
+# Local environment secrets
+traffic_ml--main/web/.env.local
