@@ -1812,7 +1812,8 @@ from api.signal_models import (
     SimulationScenario, AuditLogEntry, DataQualityFlag,
     VideoReadinessReport, SessionReadinessItem, SignalStatusResponse,
     ApprovalRequest, RejectionRequest, RecommendationStatus,
-    ManualSignalSelection, GreenExtensionRequest, RoadConfigItem
+    ManualSignalSelection, GreenExtensionRequest, RoadConfigItem,
+    StartSignalRequest
 )
 from src.signal.demand_calculator import ApproachDemandCalculator
 from src.signal.phase_validator import SignalPhaseValidator
@@ -2172,9 +2173,10 @@ def _add_audit_entry(event_type: str, intersection_id: str, details: dict,
 
 def _get_or_update_signal_status(intersection_id: str, trigger_threshold_sec: float = 8.0) -> dict:
     """
-    Compute or update the authoritative signal cycle timing for an intersection (ISSUE 5).
+    Compute or update the authoritative signal cycle timing for an intersection (ISSUE 5 & REDESIGN).
     Maintains backend authoritative end timestamp. Derived remaining time continues
     from extended end time without resets or duplicate increments.
+    Includes realistic amber transition, all-red clearance, and user-defined road name mapping.
     """
     cfg = INTERSECTION_CONFIGS.get(intersection_id)
     if not cfg:
@@ -2199,43 +2201,93 @@ def _get_or_update_signal_status(intersection_id: str, trigger_threshold_sec: fl
             "duration_sec": duration,
             "applied_extensions": set(),
             "version": 1,
+            "signal_number": 1,
+            "status": "Running",
         }
         INTERSECTION_SIGNAL_STATE[intersection_id] = state
 
     phase_idx = state["phase_index"]
     current_phase = phases[phase_idx % len(phases)]
     duration = state["duration_sec"]
+    amber_sec = float(current_phase.get("amber_sec", 3.0))
+    all_red_sec = float(current_phase.get("all_red_sec", 2.0))
+    total_cycle_step = duration + amber_sec + all_red_sec
     elapsed = (now - state["phase_start"]).total_seconds()
 
-    if elapsed >= duration:
+    if elapsed >= total_cycle_step:
         phase_idx = (phase_idx + 1) % len(phases)
         current_phase = phases[phase_idx]
         fixed_times = cfg.get("fixed_plan_green_times", {})
         pid = current_phase.get("phase_id", "P1")
         duration = float(fixed_times.get(pid, current_phase.get("min_green_sec", 30.0)))
+        amber_sec = float(current_phase.get("amber_sec", 3.0))
+        all_red_sec = float(current_phase.get("all_red_sec", 2.0))
         state["phase_index"] = phase_idx
         state["phase_start"] = now
         state["duration_sec"] = duration
         state["applied_extensions"] = set()
         state["version"] = state.get("version", 1) + 1
+        state["signal_number"] = phase_idx + 1
+        state["status"] = "Running"
         elapsed = 0.0
 
-    remaining = max(0.0, duration - elapsed)
-    should_trigger = (remaining <= trigger_threshold_sec) and (remaining > 0.0)
+    # Determine stage, state, and status label
+    if elapsed < duration:
+        signal_state = "GREEN"
+        remaining = max(0.0, duration - elapsed)
+        should_trigger = (remaining <= trigger_threshold_sec) and (remaining > 0.0)
+        status_label = "Waiting for Approval" if should_trigger else "Running"
+    elif elapsed < duration + amber_sec:
+        signal_state = "AMBER"
+        remaining = 0.0
+        should_trigger = False
+        status_label = "Transitioning"
+    else:
+        signal_state = "RED"
+        remaining = 0.0
+        should_trigger = False
+        status_label = "Completed"
 
     start_iso = state["phase_start"].isoformat()
     end_iso = (state["phase_start"] + timedelta(seconds=duration)).isoformat()
+    amber_end_iso = (state["phase_start"] + timedelta(seconds=duration + amber_sec)).isoformat()
+    all_red_end_iso = (state["phase_start"] + timedelta(seconds=duration + amber_sec + all_red_sec)).isoformat()
+
+    # Map served approaches to actual user-defined road names
+    all_roads_map = _live_states_for_intersection(cfg)
+    served_road_names = []
+    approaches = cfg.get("approaches", [])
+    for ap_id in current_phase.get("served_approaches", []):
+        ap = next((a for a in approaches if a.get("approach_id") == ap_id or a.get("direction", "").lower() == ap_id.lower()), None)
+        road_id = ap.get("road_id") if ap else ap_id
+        if road_id in all_roads_map and all_roads_map[road_id].get("name"):
+            r_name = all_roads_map[road_id]["name"]
+        elif ap and ap.get("name"):
+            r_name = ap["name"]
+        else:
+            r_name = ap_id.title()
+        if r_name not in served_road_names:
+            served_road_names.append(r_name)
 
     return {
         "intersection_id": intersection_id,
+        "intersection_name": cfg.get("name", f"Intersection {intersection_id}"),
+        "signal_number": state.get("signal_number", phase_idx + 1),
         "current_phase_id": current_phase.get("phase_id", "P1"),
         "current_phase_name": current_phase.get("phase_name", "Phase"),
         "served_approaches": current_phase.get("served_approaches", []),
+        "served_road_names": served_road_names,
+        "signal_state": signal_state,
+        "status_label": status_label,
         "phase_start_time": start_iso,
         "phase_end_time": end_iso,
         "duration_sec": round(duration, 1),
         "elapsed_sec": round(elapsed, 1),
         "remaining_green_sec": round(remaining, 1),
+        "amber_sec": amber_sec,
+        "all_red_sec": all_red_sec,
+        "amber_end_time": amber_end_iso,
+        "all_red_end_time": all_red_end_iso,
         "is_timing_available": True,
         "is_simulated": True,
         "version": state.get("version", 1),
@@ -2577,6 +2629,80 @@ def get_signal_status(intersection_id: str, trigger_threshold_sec: float = 8.0):
     if not status:
         raise HTTPException(status_code=404, detail=f"Intersection '{intersection_id}' signal status unavailable")
     return status
+
+
+@app.post("/api/intersections/{intersection_id}/start-signal")
+def start_signal_timer(intersection_id: str, req: StartSignalRequest):
+    """
+    Start or re-initialize authoritative signal timing session for an intersection (REDESIGN STEP 2).
+    - Validates intersection exists.
+    - Validates phase_id exists.
+    - Validates green duration within min/max allowable limits.
+    - Atomically updates authoritative phase start and end timestamps.
+    - Returns updated authoritative signal status.
+    """
+    cfg = INTERSECTION_CONFIGS.get(intersection_id)
+    if not cfg:
+        raise HTTPException(status_code=404, detail=f"Intersection '{intersection_id}' not found")
+
+    phases = cfg.get("phases", [])
+    matching_idx = next((i for i, p in enumerate(phases) if p.get("phase_id") == req.phase_id), None)
+    if matching_idx is None:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Phase '{req.phase_id}' not found in intersection configuration."
+        )
+
+    phase = phases[matching_idx]
+    min_g = phase.get("min_green_sec", 5.0)
+    max_g = phase.get("max_green_sec", 120.0)
+    if req.green_duration_sec < min_g or req.green_duration_sec > max_g:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Green duration {req.green_duration_sec}s outside allowed phase bounds [{min_g}s, {max_g}s]."
+        )
+
+    now = datetime.utcnow()
+    state = {
+        "phase_index": matching_idx,
+        "phase_start": now,
+        "duration_sec": float(req.green_duration_sec),
+        "applied_extensions": set(),
+        "version": INTERSECTION_SIGNAL_STATE.get(intersection_id, {}).get("version", 0) + 1,
+        "signal_number": req.signal_number or (matching_idx + 1),
+        "officer_id": req.officer_id or "officer_1",
+        "status": "Running",
+    }
+    INTERSECTION_SIGNAL_STATE[intersection_id] = state
+
+    # Also record in manual selection
+    record = {
+        "intersection_id": intersection_id,
+        "phase_id": req.phase_id,
+        "phase_name": phase.get("phase_name", req.phase_id),
+        "served_approaches": req.served_approaches or phase.get("served_approaches", []),
+        "served_movements": phase.get("permitted_movements", ["THROUGH"]),
+        "manual_green_sec": float(req.green_duration_sec),
+        "selected_by": req.officer_id or "officer_1",
+        "updated_at": now.isoformat(),
+        "is_active": True,
+        "status": "APPROVED_MANUAL_PLAN",
+    }
+    INTERSECTION_MANUAL_SELECTIONS[intersection_id] = record
+
+    _add_audit_entry(
+        "SIGNAL_TIMER_STARTED",
+        intersection_id,
+        {
+            "signal_number": req.signal_number,
+            "phase_id": req.phase_id,
+            "duration_sec": req.green_duration_sec,
+            "officer_id": req.officer_id,
+        }
+    )
+
+    log.info(f"[SIGNAL START] Started signal {req.signal_number} on {intersection_id}: phase={req.phase_id} duration={req.green_duration_sec}s")
+    return _get_or_update_signal_status(intersection_id)
 
 
 # ---------------------------------------------------------------------------

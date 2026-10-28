@@ -390,18 +390,37 @@ class VideoReadinessReport(BaseModel):
 
 class SignalStatusResponse(BaseModel):
     intersection_id: str
+    intersection_name: Optional[str] = None
+    signal_number: int = 1
     current_phase_id: str
     current_phase_name: str
     served_approaches: List[str] = []
+    served_road_names: List[str] = []
+    signal_state: str = "GREEN"  # "GREEN", "AMBER", "RED", "SIMULATED"
+    status_label: str = "Running"  # "Running", "Waiting for Approval", "Transitioning", "Completed", "Paused"
     phase_start_time: str
     phase_end_time: Optional[str] = None
     duration_sec: float
     elapsed_sec: float
     remaining_green_sec: Optional[float] = None
+    amber_sec: float = 3.0
+    all_red_sec: float = 2.0
+    amber_end_time: Optional[str] = None
+    all_red_end_time: Optional[str] = None
+    version: int = 1
     is_timing_available: bool = True
     is_simulated: bool = True
     recommendation_trigger_sec: float = 8.0
     should_trigger_recommendation: bool = False
+
+
+class StartSignalRequest(BaseModel):
+    intersection_id: str
+    phase_id: str
+    green_duration_sec: float
+    signal_number: int = 1
+    served_approaches: Optional[List[str]] = None
+    officer_id: str = "officer_1"
 
 
 class ApprovalRequest(BaseModel):

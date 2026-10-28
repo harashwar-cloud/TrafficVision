@@ -476,18 +476,37 @@ export interface VideoReadinessReport {
 
 export interface SignalStatusResponse {
   intersection_id: string;
+  intersection_name?: string;
+  signal_number?: number;
   current_phase_id: string;
   current_phase_name: string;
   served_approaches: string[];
+  served_road_names?: string[];
+  signal_state?: 'GREEN' | 'AMBER' | 'RED' | 'SIMULATED' | string;
+  status_label?: 'Running' | 'Waiting for Approval' | 'Transitioning' | 'Completed' | 'Paused' | string;
   phase_start_time: string;
   phase_end_time?: string | null;
   duration_sec: number;
   elapsed_sec: number;
   remaining_green_sec?: number | null;
+  amber_sec?: number;
+  all_red_sec?: number;
+  amber_end_time?: string | null;
+  all_red_end_time?: string | null;
+  version?: number;
   is_timing_available: boolean;
   is_simulated: boolean;
   recommendation_trigger_sec: number;
   should_trigger_recommendation: boolean;
+}
+
+export interface StartSignalPayload {
+  intersection_id: string;
+  phase_id: string;
+  green_duration_sec: number;
+  signal_number?: number;
+  served_approaches?: string[];
+  officer_id?: string;
 }
 
 export interface IntersectionAnalytics {

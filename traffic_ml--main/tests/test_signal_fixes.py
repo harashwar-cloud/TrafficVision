@@ -332,6 +332,29 @@ class TestTrafficTwinSignalFixes(unittest.TestCase):
         self.assertEqual(resp.status_code, 400)
         self.assertIn("ended", resp.json()["detail"].lower())
 
+    def test_start_signal_timer_authoritative_session(self):
+        """Clicking Start Signal creates or starts authoritative timing session."""
+        resp = self.client.post(
+            f"/api/intersections/{self.intersection_id}/start-signal",
+            json={
+                "intersection_id": self.intersection_id,
+                "phase_id": "P2",
+                "green_duration_sec": 35.0,
+                "signal_number": 2,
+                "officer_id": "officer_test"
+            }
+        )
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["current_phase_id"], "P2")
+        self.assertEqual(data["signal_number"], 2)
+        self.assertEqual(data["duration_sec"], 35.0)
+        self.assertEqual(data["signal_state"], "GREEN")
+        self.assertEqual(data["status_label"], "Running")
+        self.assertTrue(data["is_timing_available"])
+        self.assertTrue(data["is_simulated"])
+        self.assertIsNotNone(data["phase_end_time"])
+
 
 if __name__ == "__main__":
     unittest.main()

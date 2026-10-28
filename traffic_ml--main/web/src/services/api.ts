@@ -543,6 +543,19 @@ class TrafficApiService {
     }
     return await res.json();
   }
+
+  async startSignalTimer(intersectionId: string, payload: any): Promise<any> {
+    const res = await fetch(`${this.baseUrl}/api/intersections/${intersectionId}/start-signal`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error((err as any)?.detail || `Failed to start signal timer for ${intersectionId}`);
+    }
+    return await res.json();
+  }
 }
 
 export const api = new TrafficApiService();
