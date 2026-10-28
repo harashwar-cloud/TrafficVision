@@ -576,6 +576,64 @@ class TrafficApiService {
     if (!res.ok) throw new Error(`Failed to select camera ${deviceId}`);
     return await res.json();
   }
+
+  async startCameraSession(
+    sessionId: string,
+    deviceId: string,
+    deviceName: string,
+    sourceType: string = 'BROWSER_CAMERA',
+    roads?: any[],
+    cameraIndex?: number
+  ): Promise<any> {
+    const formData = new FormData();
+    formData.append('session_id', sessionId);
+    formData.append('device_id', deviceId);
+    formData.append('device_name', deviceName);
+    formData.append('source_type', sourceType);
+    if (cameraIndex !== undefined) {
+      formData.append('camera_index', cameraIndex.toString());
+    }
+    if (roads && roads.length > 0) {
+      formData.append('roads_json', JSON.stringify(roads));
+    }
+    const res = await fetch(`${this.baseUrl}/api/camera/session/start`, {
+      method: 'POST',
+      body: formData,
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error((err as any)?.detail || `Failed to start camera session ${sessionId}`);
+    }
+    return await res.json();
+  }
+
+  async sendCameraFrame(sessionId: string, frameBlob: Blob): Promise<any> {
+    const formData = new FormData();
+    formData.append('frame', frameBlob, 'frame.jpg');
+    const res = await fetch(`${this.baseUrl}/api/camera/session/${sessionId}/frame`, {
+      method: 'POST',
+      body: formData,
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error((err as any)?.detail || `Failed to process camera frame for ${sessionId}`);
+    }
+    return await res.json();
+  }
+
+  async stopCameraSession(sessionId: string): Promise<any> {
+    const res = await fetch(`${this.baseUrl}/api/camera/session/${sessionId}/stop`, {
+      method: 'POST',
+    });
+    if (!res.ok) throw new Error(`Failed to stop camera session ${sessionId}`);
+    return await res.json();
+  }
+
+  async getCameraSessionStatus(sessionId: string): Promise<any> {
+    const res = await fetch(`${this.baseUrl}/api/camera/session/${sessionId}/status`);
+    if (!res.ok) throw new Error(`Failed to get status for camera session ${sessionId}`);
+    return await res.json();
+  }
 }
 
 export const api = new TrafficApiService();

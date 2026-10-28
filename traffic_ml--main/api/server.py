@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Set, Any
 import shutil
 import cv2
+import numpy as np
 import time
 
 from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
@@ -54,6 +55,7 @@ from api.models import (
 )
 
 from src.inference.pipeline import TrafficPipeline
+from api.camera_service import CAMERA_MANAGER
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("traffictwin.api")
@@ -2782,18 +2784,31 @@ def get_device_cameras(force_refresh: bool = False):
     """
     cameras = discover_connected_cameras(max_indices=4, force_refresh=force_refresh)
     
-    # Also collect uploaded/processed video sessions
+    # Also collect active live camera sessions and uploaded/processed video sessions
     processed_sources = []
+    for sid, cam_sess in CAMERA_MANAGER.sessions.items():
+        if cam_sess.is_active:
+            processed_sources.append({
+                "source_id": sid,
+                "name": f"Live Camera: {cam_sess.device_name}",
+                "device_type": "LIVE_CAMERA",
+                "is_available": True,
+                "job_id": sid,
+                "source": cam_sess.source_type,
+                "status_text": "Live Stream Active",
+            })
+
     for job_id, job in JOBS.items():
-        processed_sources.append({
-            "source_id": job_id,
-            "name": f"Video Feed: {job.get('source_video', job_id)}",
-            "device_type": "PROCESSED_VIDEO",
-            "is_available": True,
-            "job_id": job_id,
-            "source": "uploaded_file",
-            "status_text": "Ready",
-        })
+        if job_id not in [s["source_id"] for s in processed_sources]:
+            processed_sources.append({
+                "source_id": job_id,
+                "name": f"Video Feed: {job.get('source_video', job_id)}",
+                "device_type": "PROCESSED_VIDEO",
+                "is_available": True,
+                "job_id": job_id,
+                "source": "uploaded_file",
+                "status_text": "Ready",
+            })
         
     return {
         "connected_cameras": cameras,
@@ -2814,6 +2829,192 @@ def select_camera_source(device_id: str = Form(...), camera_index: Optional[int]
         "device_id": device_id,
         "camera_index": camera_index,
         "message": f"Camera source '{device_id}' selected successfully.",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Live Camera Session & Frame Inference (BROWSER & BACKEND WEBCAMS)
+# ---------------------------------------------------------------------------
+
+@app.post("/api/camera/session/start")
+def start_camera_session(
+    background_tasks: BackgroundTasks,
+    session_id: str = Form(...),
+    device_id: str = Form(...),
+    device_name: str = Form("Live Camera"),
+    source_type: str = Form("BROWSER_CAMERA"),
+    camera_index: Optional[int] = Form(None),
+    roads_json: Optional[str] = Form(None)
+):
+    """
+    Initialize a stateful real-time tracking session for a live camera feed.
+    Compatible with browser webcams (pushed frames) and backend hardware cameras (cv2 loop).
+    """
+    manual_roads = []
+    if roads_json:
+        try:
+            manual_roads = json.loads(roads_json)
+        except Exception as e:
+            log.warning(f"Could not parse roads_json for camera {session_id}: {e}")
+    elif session_id in SESSION_ROADS:
+        manual_roads = SESSION_ROADS[session_id]
+
+    sess = CAMERA_MANAGER.get_or_create_session(
+        session_id=session_id,
+        device_id=device_id,
+        device_name=device_name,
+        source_type=source_type,
+        manual_roads=manual_roads,
+        camera_index=camera_index,
+    )
+
+    # Register into JOBS and FRAME_BUFFERS so existing APIs (stream, analytics) work identically
+    JOBS[session_id] = {
+        "job_id": session_id,
+        "status": AnalysisStatus.PROCESSING,
+        "video_name": device_name,
+        "source_video": device_name,
+        "camera_id": session_id,
+        "is_live_camera": True,
+        "frames_processed": 0,
+        "total_frames": None,
+        "current_fps": 0.0,
+    }
+    FRAME_BUFFERS[session_id] = sess.frame_buffer
+    STOP_FLAGS[session_id] = False
+    if manual_roads:
+        SESSION_ROADS[session_id] = manual_roads
+
+    # If backend OpenCV camera is chosen, spawn native capture thread
+    if source_type == "BACKEND_CAMERA" and camera_index is not None:
+        def _backend_camera_worker():
+            backend_api = cv2.CAP_DSHOW if os.name == 'nt' else cv2.CAP_ANY
+            cap = cv2.VideoCapture(int(camera_index), backend_api)
+            if not cap.isOpened():
+                log.error(f"[CAMERA WORKER] Failed to open backend camera index {camera_index}")
+                return
+            log.info(f"[CAMERA WORKER] Backend camera loop running on index {camera_index}")
+            try:
+                while sess.is_active and not STOP_FLAGS.get(session_id, False):
+                    ret, frame = cap.read()
+                    if not ret or frame is None:
+                        time.sleep(0.04)
+                        continue
+                    telemetry, _ = sess.process_frame(frame)
+                    LIVE_ANALYSIS_STATES[session_id] = telemetry
+                    time.sleep(0.03)
+            finally:
+                cap.release()
+                log.info(f"[CAMERA WORKER] Backend camera loop closed for {session_id}")
+
+        cam_thread = threading.Thread(target=_backend_camera_worker, daemon=True)
+        sess.bg_thread = cam_thread
+        cam_thread.start()
+
+    log.info(f"[CAMERA] Started session {session_id} for device '{device_name}' ({source_type})")
+    return {
+        "status": "STARTED",
+        "session_id": session_id,
+        "device_id": device_id,
+        "device_name": device_name,
+        "source_type": source_type,
+    }
+
+
+@app.post("/api/camera/session/{session_id}/frame")
+async def process_camera_frame(
+    session_id: str,
+    frame: UploadFile = File(...),
+):
+    """
+    Process a single live video frame from the browser camera.
+    Runs YOLOv8 + ByteTrack + ROI calculation with zero memory buildup,
+    updates telemetry, and enqueues annotated frame for live streaming.
+    """
+    sess = CAMERA_MANAGER.get_session(session_id)
+    if not sess:
+        sess = CAMERA_MANAGER.get_or_create_session(
+            session_id=session_id,
+            device_id=session_id,
+            device_name=f"Camera {session_id}",
+            source_type="BROWSER_CAMERA",
+            manual_roads=SESSION_ROADS.get(session_id, []),
+        )
+        JOBS[session_id] = {
+            "job_id": session_id,
+            "status": AnalysisStatus.PROCESSING,
+            "video_name": f"Camera {session_id}",
+            "camera_id": session_id,
+            "is_live_camera": True,
+            "frames_processed": 0,
+        }
+        FRAME_BUFFERS[session_id] = sess.frame_buffer
+
+    # Read image bytes
+    data = await frame.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty frame payload")
+
+    np_arr = np.frombuffer(data, np.uint8)
+    img_bgr = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+    if img_bgr is None:
+        raise HTTPException(status_code=400, detail="Failed to decode image frame")
+
+    telemetry, _ = sess.process_frame(img_bgr)
+    LIVE_ANALYSIS_STATES[session_id] = telemetry
+    if session_id in JOBS:
+        JOBS[session_id]["frames_processed"] = sess.frame_index
+        JOBS[session_id]["latest_summary"] = telemetry
+        JOBS[session_id]["current_fps"] = telemetry.get("processing_fps", 0.0)
+
+    # Broadcast via WebSocket if connected
+    ws_set = ACTIVE_WEBSOCKETS.get(session_id)
+    if ws_set:
+        msg = json.dumps(telemetry)
+        dead = set()
+        for ws in list(ws_set):
+            try:
+                if MAIN_EVENT_LOOP and MAIN_EVENT_LOOP.is_running():
+                    asyncio.run_coroutine_threadsafe(ws.send_text(msg), MAIN_EVENT_LOOP)
+            except Exception:
+                dead.add(ws)
+        ws_set -= dead
+
+    return {
+        "status": "OK",
+        "session_id": session_id,
+        "frame_index": sess.frame_index,
+        "telemetry": telemetry,
+    }
+
+
+@app.post("/api/camera/session/{session_id}/stop")
+def stop_camera_session(session_id: str):
+    """
+    Halt a live camera session cleanly and free GPU/tracker resources.
+    """
+    CAMERA_MANAGER.stop_session(session_id)
+    STOP_FLAGS[session_id] = True
+    if session_id in JOBS:
+        JOBS[session_id]["status"] = AnalysisStatus.IDLE
+    return {"status": "STOPPED", "session_id": session_id}
+
+
+@app.get("/api/camera/session/{session_id}/status")
+def get_camera_session_status(session_id: str):
+    """
+    Retrieve current status and telemetry for a camera session.
+    """
+    sess = CAMERA_MANAGER.get_session(session_id)
+    if not sess:
+        raise HTTPException(status_code=404, detail=f"Camera session '{session_id}' not found")
+    return {
+        "session_id": session_id,
+        "device_name": sess.device_name,
+        "source_type": sess.source_type,
+        "is_active": sess.is_active,
+        "frame_index": sess.frame_index,
+        "telemetry": sess.latest_telemetry,
     }
 
 

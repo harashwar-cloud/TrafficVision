@@ -8,7 +8,7 @@ import {
   Activity, Upload, RefreshCw, Zap,
   AlertTriangle, ChevronDown, Compass,
   TrendingUp, Car, Truck, Bus, Bike, Edit, Trash2, Check,
-  Plus, Square, RotateCcw, X, Film, Layers
+  Plus, Square, RotateCcw, X, Film, Layers, Camera
 } from 'lucide-react';
 
 interface LiveAnalysisProps {
@@ -288,12 +288,31 @@ const TotalRoadSummaryCard: React.FC<{ totalSummary: RoadAnalytics; roadsCount: 
   );
 };
 
+// ─── Live Camera & Connected Device Types ─────────────────────────────────────
+export interface CameraDeviceOption {
+  deviceId: string;
+  label: string;
+  kind: 'browser' | 'backend';
+  cameraIndex?: number;
+}
+
+interface ActiveCameraWorker {
+  sessionId: string;
+  stream: MediaStream | null;
+  stopWorker: () => void;
+  telemetry: LiveAnalysisState | null;
+}
+
+// Global active camera stream registry (persists streaming across route changes)
+const GLOBAL_ACTIVE_CAMERAS = new Map<string, ActiveCameraWorker>();
+
 // ─── Individual VideoSessionCard Component ─────────────────────────────────────
 interface VideoSessionCardProps {
   videoId: string;
   index: number;
   totalCards: number;
   initialPreset?: string;
+  initialInputMode?: 'UPLOAD' | 'CAMERA' | 'PRESET';
   onRemove: (videoId: string) => void;
 }
 
@@ -302,10 +321,29 @@ const VideoSessionCard: React.FC<VideoSessionCardProps> = ({
   index,
   totalCards,
   initialPreset,
+  initialInputMode,
   onRemove,
 }) => {
   const proc = useVideoProcessing();
   const isPrimary = index === 0;
+
+  // Input Mode: UPLOAD (File) | CAMERA (Live Webcam/USB) | PRESET (Traffic Cam)
+  const [inputMode, setInputMode] = useState<'UPLOAD' | 'CAMERA' | 'PRESET'>(
+    initialInputMode || (initialPreset ? 'PRESET' : 'UPLOAD')
+  );
+
+  // Live Camera states
+  const [availableCameras, setAvailableCameras] = useState<CameraDeviceOption[]>([]);
+  const [selectedCameraId, setSelectedCameraId] = useState<string>('');
+  const [isScanningCameras, setIsScanningCameras] = useState<boolean>(false);
+  const [cameraPermissionError, setCameraPermissionError] = useState<string | null>(null);
+  const [isCameraActive, setIsCameraActive] = useState<boolean>(false);
+  const [cameraConnectionStatus, setCameraConnectionStatus] = useState<string>('Ready');
+
+  const cameraVideoRef = useRef<HTMLVideoElement>(null);
+  const cameraStreamRef = useRef<MediaStream | null>(null);
+  const isFrameInFlightRef = useRef<boolean>(false);
+  const cameraFrameIntervalRef = useRef<number | null>(null);
 
   // Local states for secondary multi-video cards
   const [localPreset, setLocalPreset] = useState<string>(initialPreset || '');
@@ -444,9 +482,160 @@ const VideoSessionCard: React.FC<VideoSessionCardProps> = ({
     };
   }, [isPrimary, activeJobId, localIsAnalyzing]);
 
+  // Discover cameras connected to user browser or backend host
+  const scanCameras = useCallback(async () => {
+    setIsScanningCameras(true);
+    setCameraPermissionError(null);
+    const discovered: CameraDeviceOption[] = [];
+
+    // 1. Browser MediaDevices API
+    try {
+      if (typeof navigator !== 'undefined' && navigator.mediaDevices?.enumerateDevices) {
+        let devices = await navigator.mediaDevices.enumerateDevices();
+        let videoDevs = devices.filter((d) => d.kind === 'videoinput');
+
+        // If labels are empty (pre-permission state), request temporary stream to unlock labels
+        const needPermission = videoDevs.some((d) => !d.label);
+        if (needPermission) {
+          try {
+            const testStream = await navigator.mediaDevices.getUserMedia({ video: true });
+            testStream.getTracks().forEach((t) => t.stop());
+            devices = await navigator.mediaDevices.enumerateDevices();
+            videoDevs = devices.filter((d) => d.kind === 'videoinput');
+          } catch (permErr: any) {
+            console.warn('Camera permission check prompt:', permErr);
+            if (permErr.name === 'NotAllowedError' || permErr.name === 'PermissionDeniedError') {
+              setCameraPermissionError('Camera permission was denied. Allow camera access in browser address bar to use webcams.');
+            }
+          }
+        }
+
+        videoDevs.forEach((d, i) => {
+          discovered.push({
+            deviceId: d.deviceId,
+            label: d.label || `Integrated Webcam ${i + 1}`,
+            kind: 'browser',
+          });
+        });
+      }
+    } catch (e: any) {
+      console.warn('Browser enumerateDevices error:', e);
+    }
+
+    // 2. Backend host cameras (OpenCV)
+    try {
+      const backendRes = await api.getConnectedCameras(true);
+      if (backendRes && Array.isArray(backendRes.connected_cameras)) {
+        backendRes.connected_cameras.forEach((cam: any) => {
+          if (cam.is_available) {
+            discovered.push({
+              deviceId: cam.device_id,
+              label: `${cam.name} (Host OpenCV)`,
+              kind: 'backend',
+              cameraIndex: cam.index,
+            });
+          }
+        });
+      }
+    } catch (e) {
+      console.warn('Backend cameras query error:', e);
+    }
+
+    setAvailableCameras(discovered);
+    if (discovered.length > 0 && !selectedCameraId) {
+      setSelectedCameraId(discovered[0].deviceId);
+    }
+    setIsScanningCameras(false);
+  }, [selectedCameraId]);
+
+  // Start live camera stream preview
+  const startCameraPreview = useCallback(async (devId: string) => {
+    if (!devId) return;
+    const targetDev = availableCameras.find((c) => c.deviceId === devId) || availableCameras[0];
+    if (!targetDev) return;
+
+    if (cameraStreamRef.current) {
+      cameraStreamRef.current.getTracks().forEach((t) => t.stop());
+      cameraStreamRef.current = null;
+    }
+
+    if (targetDev.kind === 'browser') {
+      try {
+        setCameraConnectionStatus('Connecting...');
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            deviceId: devId ? { exact: devId } : undefined,
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+          },
+        });
+        cameraStreamRef.current = stream;
+        if (cameraVideoRef.current) {
+          cameraVideoRef.current.srcObject = stream;
+          cameraVideoRef.current.play().catch(() => {});
+        }
+        setIsCameraActive(true);
+        setCameraConnectionStatus('Live Preview Ready');
+        setCameraPermissionError(null);
+        if (isPrimary) {
+          proc.setVideoName(targetDev.label);
+        } else {
+          setLocalVideoName(targetDev.label);
+        }
+      } catch (err: any) {
+        console.error('Camera stream access error:', err);
+        setIsCameraActive(false);
+        setCameraConnectionStatus('Offline / Permission Needed');
+        if (err.name === 'NotAllowedError') {
+          setCameraPermissionError('Camera permission denied by user.');
+        } else if (err.name === 'NotReadableError') {
+          setCameraPermissionError('Camera is already in use by another application.');
+        } else {
+          setCameraPermissionError(err.message || 'Could not connect to camera.');
+        }
+      }
+    } else {
+      setIsCameraActive(true);
+      setCameraConnectionStatus('Backend OpenCV Camera Ready');
+      if (isPrimary) {
+        proc.setVideoName(targetDev.label);
+      } else {
+        setLocalVideoName(targetDev.label);
+      }
+    }
+  }, [availableCameras, isPrimary, proc]);
+
+  // Trigger camera scan when camera tab is selected
+  useEffect(() => {
+    if (inputMode === 'CAMERA') {
+      scanCameras();
+    }
+  }, [inputMode, scanCameras]);
+
+  // Start preview whenever selected camera changes in camera mode
+  useEffect(() => {
+    if (inputMode === 'CAMERA' && selectedCameraId && availableCameras.length > 0) {
+      startCameraPreview(selectedCameraId);
+    }
+  }, [inputMode, selectedCameraId, availableCameras, startCameraPreview]);
+
+  // Re-attach active camera worker if navigating back to this card
+  useEffect(() => {
+    const existing = GLOBAL_ACTIVE_CAMERAS.get(videoId) || (activeJobId ? GLOBAL_ACTIVE_CAMERAS.get(activeJobId) : undefined);
+    if (existing && existing.stream) {
+      cameraStreamRef.current = existing.stream;
+      if (cameraVideoRef.current) {
+        cameraVideoRef.current.srcObject = existing.stream;
+        cameraVideoRef.current.play().catch(() => {});
+      }
+      setIsCameraActive(true);
+      setCameraConnectionStatus('Live Camera Stream Active');
+    }
+  }, [videoId, activeJobId]);
+
   // Coordinate alignment helper for canvas
   const getVideoRenderBox = useCallback(() => {
-    const video = videoRef.current;
+    const video = inputMode === 'CAMERA' ? (cameraVideoRef.current || videoRef.current) : videoRef.current;
     const canvas = canvasRef.current;
     const displayW = video?.clientWidth || video?.offsetWidth || canvas?.width || 640;
     const displayH = video?.clientHeight || video?.offsetHeight || canvas?.height || 360;
@@ -474,11 +663,11 @@ const VideoSessionCard: React.FC<VideoSessionCardProps> = ({
     }
 
     return { offsetX, offsetY, renderedW, renderedH, srcW, srcH, displayW, displayH };
-  }, []);
+  }, [inputMode]);
 
   const redrawCanvas = useCallback(() => {
     const canvas = canvasRef.current;
-    const video = videoRef.current;
+    const video = inputMode === 'CAMERA' ? (cameraVideoRef.current || videoRef.current) : videoRef.current;
     if (!canvas || !video) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
@@ -806,7 +995,132 @@ const VideoSessionCard: React.FC<VideoSessionCardProps> = ({
     setCurrentPolygon([]);
   };
 
+  const handleSwitchMode = (mode: 'UPLOAD' | 'CAMERA' | 'PRESET') => {
+    if (isAnalyzing) {
+      if (!confirm('This source is actively being analyzed. Stop analysis and switch input mode?')) {
+        return;
+      }
+      handleStopInference();
+    }
+    setInputMode(mode);
+    setDrawingMode(false);
+    setCurrentPolygon([]);
+    if (mode === 'CAMERA') {
+      scanCameras();
+    }
+  };
+
   const handleStartInference = async () => {
+    // ── LIVE CAMERA PROCESSING ──
+    if (inputMode === 'CAMERA') {
+      if (manualRoads.length === 0 && drawingMode) {
+        alert('Please finish drawing at least one road region before processing.');
+        return;
+      }
+      const targetDev = availableCameras.find((c) => c.deviceId === selectedCameraId) || availableCameras[0];
+      const devLabel = targetDev ? targetDev.label : 'Live Camera';
+      const devId = targetDev ? targetDev.deviceId : videoId;
+      const isBackend = targetDev?.kind === 'backend';
+      const targetJobId = activeJobId || videoId;
+
+      try {
+        setDrawingMode(false);
+        if (isPrimary) {
+          proc.setActiveJobId(targetJobId);
+          proc.setVideoName(devLabel);
+          proc.setStatusMessage('Starting Live Camera GPU tracking...');
+        } else {
+          setLocalActiveJobId(targetJobId);
+          setLocalVideoName(devLabel);
+          setLocalIsAnalyzing(true);
+          setLocalInferenceComplete(false);
+          setLocalStatusMessage('Starting Live Camera GPU tracking...');
+        }
+
+        await api.startCameraSession(
+          targetJobId,
+          devId,
+          devLabel,
+          isBackend ? 'BACKEND_CAMERA' : 'BROWSER_CAMERA',
+          manualRoads,
+          targetDev?.cameraIndex
+        );
+
+        if (isPrimary) {
+          proc.setStatusMessage('✓ Live Camera tracking running on GPU...');
+        } else {
+          setLocalStatusMessage('✓ Live Camera tracking running on GPU...');
+        }
+
+        // If browser camera, start canvas frame-pushing loop with backpressure protection
+        if (!isBackend) {
+          if (cameraFrameIntervalRef.current) {
+            clearInterval(cameraFrameIntervalRef.current);
+          }
+          const offscreenCanvas = document.createElement('canvas');
+          const offscreenCtx = offscreenCanvas.getContext('2d');
+
+          const pushFrame = async () => {
+            if (!cameraVideoRef.current || isFrameInFlightRef.current) return;
+            const vid = cameraVideoRef.current;
+            if (vid.readyState < 2 || vid.videoWidth === 0) return;
+
+            isFrameInFlightRef.current = true;
+            try {
+              offscreenCanvas.width = vid.videoWidth;
+              offscreenCanvas.height = vid.videoHeight;
+              offscreenCtx?.drawImage(vid, 0, 0);
+
+              offscreenCanvas.toBlob(async (blob) => {
+                if (!blob) {
+                  isFrameInFlightRef.current = false;
+                  return;
+                }
+                try {
+                  const res = await api.sendCameraFrame(targetJobId, blob);
+                  if (res && res.telemetry) {
+                    if (isPrimary) {
+                      // Handled by telemetry update
+                    } else {
+                      setLocalLiveTelemetry(res.telemetry);
+                    }
+                  }
+                } catch (e) {
+                  console.warn('Frame push warning:', e);
+                } finally {
+                  isFrameInFlightRef.current = false;
+                }
+              }, 'image/jpeg', 0.75);
+            } catch (e) {
+              isFrameInFlightRef.current = false;
+            }
+          };
+
+          const intervalId = window.setInterval(pushFrame, 150);
+          cameraFrameIntervalRef.current = intervalId;
+
+          GLOBAL_ACTIVE_CAMERAS.set(targetJobId, {
+            sessionId: targetJobId,
+            stream: cameraStreamRef.current,
+            stopWorker: () => {
+              clearInterval(intervalId);
+              api.stopCameraSession(targetJobId).catch(() => {});
+            },
+            telemetry: null,
+          });
+        }
+      } catch (err: any) {
+        const msg = `✗ Camera start failed: ${err.message}`;
+        if (isPrimary) proc.setStatusMessage(msg);
+        else {
+          setLocalIsAnalyzing(false);
+          setLocalStatusMessage(msg);
+        }
+      }
+      return;
+    }
+
+    // ── VIDEO FILE / PRESET PROCESSING ──
     if (uploadedVideoUrl && manualRoads.length === 0 && drawingMode) {
       alert('Please finish drawing at least one road region before processing.');
       return;
@@ -843,6 +1157,27 @@ const VideoSessionCard: React.FC<VideoSessionCardProps> = ({
   };
 
   const handleStopInference = async () => {
+    if (cameraFrameIntervalRef.current) {
+      clearInterval(cameraFrameIntervalRef.current);
+      cameraFrameIntervalRef.current = null;
+    }
+    const targetJobId = activeJobId || videoId;
+    if (GLOBAL_ACTIVE_CAMERAS.has(targetJobId)) {
+      GLOBAL_ACTIVE_CAMERAS.get(targetJobId)?.stopWorker();
+      GLOBAL_ACTIVE_CAMERAS.delete(targetJobId);
+    }
+    if (inputMode === 'CAMERA') {
+      try {
+        await api.stopCameraSession(targetJobId);
+      } catch {}
+      if (isPrimary) {
+        proc.setStatusMessage('Live Camera analysis stopped.');
+      } else {
+        setLocalIsAnalyzing(false);
+        setLocalStatusMessage('Live Camera analysis stopped.');
+      }
+      return;
+    }
     if (isPrimary) {
       await proc.stopInference();
       return;
@@ -859,9 +1194,22 @@ const VideoSessionCard: React.FC<VideoSessionCardProps> = ({
 
   const handleRemoveCard = () => {
     if (isAnalyzing || (manualRoads.length > 0 && !inferenceComplete)) {
-      if (!confirm('This video is currently being analyzed or has unsaved configurations. Are you sure you want to remove it?')) {
+      if (!confirm('This source is actively being analyzed or has unsaved configurations. Are you sure you want to remove it?')) {
         return;
       }
+    }
+    if (cameraFrameIntervalRef.current) {
+      clearInterval(cameraFrameIntervalRef.current);
+      cameraFrameIntervalRef.current = null;
+    }
+    if (cameraStreamRef.current) {
+      cameraStreamRef.current.getTracks().forEach((t) => t.stop());
+      cameraStreamRef.current = null;
+    }
+    const targetJobId = activeJobId || videoId;
+    if (GLOBAL_ACTIVE_CAMERAS.has(targetJobId)) {
+      GLOBAL_ACTIVE_CAMERAS.get(targetJobId)?.stopWorker();
+      GLOBAL_ACTIVE_CAMERAS.delete(targetJobId);
     }
     if (activeJobId) {
       api.deleteSession(activeJobId).catch(() => {});
@@ -930,24 +1278,40 @@ const VideoSessionCard: React.FC<VideoSessionCardProps> = ({
   const totalSummary: RoadAnalytics | undefined = liveTelemetry?.total_road_summary;
   const processingFps = safeNum(liveTelemetry?.processing_fps, 0);
 
-  const hasVideoSource = Boolean(uploadedVideoUrl || activeJobId);
+  const hasVideoSource =
+    inputMode === 'CAMERA'
+      ? Boolean(isCameraActive || activeJobId)
+      : inputMode === 'PRESET'
+      ? Boolean(selectedPreset || activeJobId)
+      : Boolean(uploadedVideoUrl || activeJobId);
 
   return (
     <div className="bg-slate-900/90 border border-slate-800 hover:border-slate-700/80 rounded-3xl p-5 shadow-2xl backdrop-blur-xl transition-all duration-300 flex flex-col space-y-4">
       {/* ─── CARD HEADER & CONTROLS ───────────────────────────────── */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between pb-3 border-b border-slate-800 gap-3">
         <div className="flex items-center space-x-3">
-          <div className="p-2 bg-cyan-950/80 border border-cyan-500/40 rounded-xl text-cyan-400 font-mono text-xs font-bold">
-            VID {index + 1}
+          <div className={`p-2 rounded-xl font-mono text-xs font-bold border ${
+            inputMode === 'CAMERA'
+              ? 'bg-emerald-950/80 border-emerald-500/40 text-emerald-400'
+              : inputMode === 'PRESET'
+              ? 'bg-violet-950/80 border-violet-500/40 text-violet-400'
+              : 'bg-cyan-950/80 border-cyan-500/40 text-cyan-400'
+          }`}>
+            {inputMode === 'CAMERA' ? `CAM ${index + 1}` : inputMode === 'PRESET' ? `PRE ${index + 1}` : `VID ${index + 1}`}
           </div>
           <div>
             <div className="flex items-center space-x-2">
-              <h3 className="text-sm font-bold font-mono text-slate-100 truncate max-w-[200px] sm:max-w-xs" title={videoName || `Video Feed ${index + 1}`}>
-                {videoName || `Video Source ${index + 1}`}
+              <h3 className="text-sm font-bold font-mono text-slate-100 truncate max-w-[200px] sm:max-w-xs" title={videoName || `Feed ${index + 1}`}>
+                {videoName || (inputMode === 'CAMERA' ? `Live Camera ${index + 1}` : `Video Source ${index + 1}`)}
               </h3>
-              {videoDuration > 0 && (
+              {videoDuration > 0 && inputMode !== 'CAMERA' && (
                 <span className="px-1.5 py-0.5 rounded bg-slate-950 border border-slate-800 text-[10px] font-mono text-slate-400">
                   {videoDuration.toFixed(1)}s
+                </span>
+              )}
+              {inputMode === 'CAMERA' && isCameraActive && (
+                <span className="px-2 py-0.5 rounded-full bg-emerald-950/80 border border-emerald-600/50 text-[10px] font-mono font-bold text-emerald-400 animate-pulse">
+                  LIVE
                 </span>
               )}
             </div>
@@ -991,6 +1355,8 @@ const VideoSessionCard: React.FC<VideoSessionCardProps> = ({
                   className={`flex items-center px-3.5 py-1.5 rounded-xl text-xs font-bold font-mono uppercase tracking-wider transition-all shadow-lg ${
                     manualRoads.length === 0 && drawingMode
                       ? 'bg-slate-800 text-slate-500 cursor-not-allowed border border-slate-700'
+                      : inputMode === 'CAMERA'
+                      ? 'bg-emerald-500 hover:bg-emerald-400 text-slate-950 shadow-emerald-500/25 active:scale-95'
                       : 'bg-cyan-500 hover:bg-cyan-400 text-slate-950 shadow-cyan-500/25 active:scale-95'
                   }`}
                   title="Run GPU Analysis"
@@ -1002,11 +1368,11 @@ const VideoSessionCard: React.FC<VideoSessionCardProps> = ({
             </>
           )}
 
-          {/* Remove Video Card Button */}
+          {/* Remove Video/Camera Card Button */}
           {totalCards > 1 && (
             <button
               onClick={handleRemoveCard}
-              title="Remove Video Card"
+              title="Remove Source Card"
               className="p-1.5 text-slate-500 hover:text-red-400 bg-slate-950 border border-slate-800 hover:border-red-900/50 rounded-xl transition-colors"
             >
               <Trash2 className="w-4 h-4" />
@@ -1014,6 +1380,126 @@ const VideoSessionCard: React.FC<VideoSessionCardProps> = ({
           )}
         </div>
       </div>
+
+      {/* ─── SOURCE INPUT TABS: Upload Video | Live Camera | Camera Presets ─── */}
+      <div className="flex flex-wrap items-center justify-between bg-slate-950/80 p-1.5 rounded-2xl border border-slate-800 gap-2">
+        <div className="flex flex-wrap items-center gap-1.5">
+          <button
+            onClick={() => handleSwitchMode('UPLOAD')}
+            className={`flex items-center px-3 py-1.5 rounded-xl text-xs font-mono font-bold transition-all ${
+              inputMode === 'UPLOAD'
+                ? 'bg-cyan-500 text-slate-950 shadow-md shadow-cyan-500/25'
+                : 'text-slate-400 hover:text-slate-200 hover:bg-slate-900'
+            }`}
+          >
+            <Upload className="w-3.5 h-3.5 mr-1.5" />
+            Upload Video
+          </button>
+
+          <button
+            onClick={() => handleSwitchMode('CAMERA')}
+            className={`flex items-center px-3 py-1.5 rounded-xl text-xs font-mono font-bold transition-all ${
+              inputMode === 'CAMERA'
+                ? 'bg-emerald-500 text-slate-950 shadow-md shadow-emerald-500/25'
+                : 'text-slate-400 hover:text-slate-200 hover:bg-slate-900'
+            }`}
+          >
+            <Camera className="w-3.5 h-3.5 mr-1.5" />
+            Live Camera
+          </button>
+
+          <button
+            onClick={() => handleSwitchMode('PRESET')}
+            className={`flex items-center px-3 py-1.5 rounded-xl text-xs font-mono font-bold transition-all ${
+              inputMode === 'PRESET'
+                ? 'bg-violet-500 text-slate-950 shadow-md shadow-violet-500/25'
+                : 'text-slate-400 hover:text-slate-200 hover:bg-slate-900'
+            }`}
+          >
+            <Film className="w-3.5 h-3.5 mr-1.5" />
+            Camera Presets
+          </button>
+        </div>
+
+        <span className="hidden sm:inline-flex px-2 py-0.5 rounded-lg bg-slate-900 border border-slate-800 text-[10px] font-mono text-slate-400">
+          {inputMode === 'CAMERA'
+            ? 'Webcam / USB Live'
+            : inputMode === 'PRESET'
+            ? 'Traffic Camera Preset'
+            : 'Local Traffic Video'}
+        </span>
+      </div>
+
+      {/* ─── LIVE CAMERA CONTROLS BAR (When Camera Mode Active) ─── */}
+      {inputMode === 'CAMERA' && (
+        <div className="bg-slate-950/80 border border-emerald-900/40 rounded-2xl p-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3 shadow-inner">
+          <div className="flex-1 flex flex-col sm:flex-row sm:items-center gap-2">
+            <span className="text-[11px] font-mono uppercase text-slate-400 tracking-wider whitespace-nowrap flex items-center">
+              <Camera className="w-3.5 h-3.5 mr-1.5 text-emerald-400" />
+              Connected Camera:
+            </span>
+            <div className="relative flex-1 max-w-sm">
+              <select
+                value={selectedCameraId}
+                onChange={(e) => {
+                  setSelectedCameraId(e.target.value);
+                  startCameraPreview(e.target.value);
+                }}
+                className="w-full appearance-none bg-slate-900 border border-slate-700 text-slate-200 text-xs font-mono rounded-xl px-3 py-1.5 pr-8 focus:outline-none focus:ring-1 focus:ring-emerald-500 cursor-pointer"
+              >
+                {availableCameras.length === 0 ? (
+                  <option value="">No cameras detected — click Refresh</option>
+                ) : (
+                  availableCameras.map((cam) => (
+                    <option key={cam.deviceId} value={cam.deviceId}>
+                      {cam.label} {cam.kind === 'backend' ? '(Host OpenCV)' : '(Browser)'}
+                    </option>
+                  ))
+                )}
+              </select>
+              <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-2 text-slate-400">
+                <ChevronDown className="w-3.5 h-3.5" />
+              </div>
+            </div>
+          </div>
+
+          <div className="flex items-center space-x-2">
+            <button
+              onClick={scanCameras}
+              disabled={isScanningCameras}
+              className="flex items-center px-3 py-1.5 rounded-xl text-xs font-mono font-bold bg-slate-900 border border-slate-700 hover:border-emerald-500/50 text-slate-300 transition-all shadow-inner"
+              title="Refresh / Scan Cameras"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 mr-1.5 ${isScanningCameras ? 'animate-spin text-emerald-400' : 'text-slate-400'}`} />
+              Refresh Cameras
+            </button>
+
+            <span className={`px-2.5 py-1 rounded-xl border text-[11px] font-mono font-semibold ${
+              isCameraActive
+                ? 'bg-emerald-950/70 border-emerald-600/50 text-emerald-300'
+                : 'bg-slate-900 border-slate-700 text-slate-400'
+            }`}>
+              {cameraConnectionStatus}
+            </span>
+          </div>
+        </div>
+      )}
+
+      {/* Permission / Device Error Banner */}
+      {cameraPermissionError && (
+        <div className="p-3 bg-red-950/70 border border-red-700/60 rounded-2xl flex items-center justify-between text-xs font-mono text-red-200">
+          <div className="flex items-center space-x-2">
+            <AlertTriangle className="w-4 h-4 text-red-400 flex-shrink-0" />
+            <span>{cameraPermissionError}</span>
+          </div>
+          <button
+            onClick={scanCameras}
+            className="px-2.5 py-1 rounded-lg bg-red-900/60 hover:bg-red-800 border border-red-700 text-[11px] font-bold text-white transition-all"
+          >
+            Retry Permission
+          </button>
+        </div>
+      )}
 
       {/* ─── STATUS & PROGRESS BANNER ──────────────────────────────── */}
       {(statusMessage || isAnalyzing) && (
@@ -1033,12 +1519,11 @@ const VideoSessionCard: React.FC<VideoSessionCardProps> = ({
             </div>
             {isAnalyzing && (
               <span className="font-bold text-cyan-400 ml-2 whitespace-nowrap">
-                F {(isPrimary ? proc.framesProcessed : liveTelemetry?.frame_index) || 0}/{(isPrimary ? proc.totalFrames : liveTelemetry?.total_frames) || 600} (
-                {isPrimary ? proc.progressPct : Math.round((((liveTelemetry?.frame_index || 0) / (liveTelemetry?.total_frames || 600)) * 100))}%) • {safeFixed(processingFps || (isPrimary ? proc.currentFps : 0), 1)} FPS
+                F {(isPrimary ? proc.framesProcessed : liveTelemetry?.frame_index) || 0}/{(isPrimary ? proc.totalFrames : liveTelemetry?.total_frames) || (inputMode === 'CAMERA' ? 'LIVE' : 600)} • {safeFixed(processingFps || (isPrimary ? proc.currentFps : 0), 1)} FPS
               </span>
             )}
           </div>
-          {isAnalyzing && (
+          {isAnalyzing && inputMode !== 'CAMERA' && (
             <div className="w-full bg-slate-950 rounded-full h-1.5 overflow-hidden border border-slate-800 shadow-inner">
               <div
                 className="bg-gradient-to-r from-cyan-500 via-blue-500 to-emerald-400 h-full transition-all duration-300"
@@ -1049,8 +1534,8 @@ const VideoSessionCard: React.FC<VideoSessionCardProps> = ({
         </div>
       )}
 
-      {/* ─── MAIN VIDEO AREA / DROPZONE ───────────────────────────── */}
-      {!hasVideoSource ? (
+      {/* ─── MAIN VIDEO / CAMERA VIEWPORT ───────────────────────────── */}
+      {!hasVideoSource && inputMode === 'UPLOAD' ? (
         /* Empty Card: Drag-and-Drop & Video Selection Area */
         <div
           onDragOver={handleDragOver}
@@ -1075,28 +1560,30 @@ const VideoSessionCard: React.FC<VideoSessionCardProps> = ({
             Select Video File
             <input type="file" accept="video/mp4,video/avi,video/mov,video/mkv" onChange={handleFileInput} className="hidden" />
           </label>
-
-          {/* Quick preset selection */}
-          <div className="w-full max-w-xs pt-3 border-t border-slate-800/80">
-            <label className="text-[10px] font-mono text-slate-400 uppercase tracking-wider mb-1 block">
-              Or pick preset camera:
-            </label>
-            <div className="relative">
-              <select
-                value={selectedPreset}
-                onChange={(e) => handleSelectPreset(e.target.value)}
-                className="w-full appearance-none bg-slate-950 border border-slate-800 hover:border-slate-700 text-slate-300 text-xs font-mono rounded-xl px-3 py-1.5 focus:outline-none focus:ring-1 focus:ring-cyan-500 cursor-pointer"
-              >
-                <option value="" disabled>Choose Traffic Camera Preset...</option>
-                {FEED_SOURCES.map((source) => (
-                  <option key={source.id} value={source.id}>
-                    {source.name}
-                  </option>
-                ))}
-              </select>
-              <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-2 text-slate-400">
-                <ChevronDown className="w-3.5 h-3.5" />
-              </div>
+        </div>
+      ) : !hasVideoSource && inputMode === 'PRESET' ? (
+        /* Empty Preset Selection Area */
+        <div className="relative aspect-video rounded-2xl border-2 border-dashed border-slate-700/80 bg-slate-950/60 flex flex-col items-center justify-center p-6 text-center">
+          <div className="p-3 bg-slate-900 border border-slate-800 rounded-2xl text-violet-400 mb-3 shadow-inner">
+            <Film className="w-8 h-8" />
+          </div>
+          <h4 className="text-sm font-bold text-slate-200 mb-1">Pick Traffic Camera Preset</h4>
+          <p className="text-xs text-slate-500 font-mono mb-4">Select a pre-configured intersection camera feed</p>
+          <div className="w-full max-w-sm relative">
+            <select
+              value={selectedPreset}
+              onChange={(e) => handleSelectPreset(e.target.value)}
+              className="w-full appearance-none bg-slate-950 border border-slate-800 hover:border-slate-700 text-slate-300 text-xs font-mono rounded-xl px-3 py-2 pr-8 focus:outline-none focus:ring-1 focus:ring-violet-500 cursor-pointer"
+            >
+              <option value="" disabled>Choose Traffic Camera Preset...</option>
+              {FEED_SOURCES.map((source) => (
+                <option key={source.id} value={source.id}>
+                  {source.name}
+                </option>
+              ))}
+            </select>
+            <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-2 text-slate-400">
+              <ChevronDown className="w-3.5 h-3.5" />
             </div>
           </div>
         </div>
@@ -1110,7 +1597,11 @@ const VideoSessionCard: React.FC<VideoSessionCardProps> = ({
               <button
                 onClick={() => {
                   setVideoError(false);
-                  if (videoRef.current) videoRef.current.load();
+                  if (inputMode === 'CAMERA') {
+                    if (selectedCameraId) startCameraPreview(selectedCameraId);
+                  } else if (videoRef.current) {
+                    videoRef.current.load();
+                  }
                 }}
                 className="mt-3 inline-flex items-center px-3 py-1 text-xs font-mono text-cyan-400 bg-cyan-950/70 border border-cyan-800 rounded-lg hover:bg-cyan-900"
               >
@@ -1123,6 +1614,21 @@ const VideoSessionCard: React.FC<VideoSessionCardProps> = ({
               alt="Live GPU Inference"
               className="w-full h-full object-contain"
               onError={() => setVideoError(true)}
+            />
+          ) : inputMode === 'CAMERA' ? (
+            <video
+              ref={cameraVideoRef}
+              autoPlay
+              playsInline
+              muted
+              className="w-full h-full object-contain"
+              onLoadedMetadata={(e) => {
+                const target = e.target as HTMLVideoElement;
+                const w = target.videoWidth || 1280;
+                const h = target.videoHeight || 720;
+                setVideoMeta({ width: w, height: h, fps: 30 });
+                videoMetaRef.current = { width: w, height: h, fps: 30 };
+              }}
             />
           ) : (
             <video
@@ -1140,6 +1646,7 @@ const VideoSessionCard: React.FC<VideoSessionCardProps> = ({
                 const w = target.videoWidth || 1920;
                 const h = target.videoHeight || 1080;
                 setVideoMeta({ width: w, height: h, fps: 24 });
+                videoMetaRef.current = { width: w, height: h, fps: 24 };
                 setVideoDuration(target.duration || 0);
               }}
               onError={() => {
@@ -1403,14 +1910,19 @@ const VideoSessionCard: React.FC<VideoSessionCardProps> = ({
 
 // ─── Top-Level Multi-Video LiveAnalysis Workspace ──────────────────────────────
 export const LiveAnalysis: React.FC<LiveAnalysisProps> = ({ state: _state, onRefresh }) => {
-  // Collection of video cards keyed by unique, stable videoId
-  const [videoCards, setVideoCards] = useState<Array<{ id: string; preset?: string }>>([
-    { id: 'video_card_1', preset: 'cam_5' },
+  // Collection of video/camera cards keyed by unique, stable videoId
+  const [videoCards, setVideoCards] = useState<Array<{ id: string; preset?: string; inputMode?: 'UPLOAD' | 'CAMERA' | 'PRESET' }>>([
+    { id: 'video_card_1', preset: 'cam_5', inputMode: 'PRESET' },
   ]);
 
   const handleAddVideo = () => {
     const newId = `video_card_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
-    setVideoCards((prev) => [...prev, { id: newId }]);
+    setVideoCards((prev) => [...prev, { id: newId, inputMode: 'UPLOAD' }]);
+  };
+
+  const handleAddCamera = () => {
+    const newId = `camera_card_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+    setVideoCards((prev) => [...prev, { id: newId, inputMode: 'CAMERA' }]);
   };
 
   const handleRemoveVideo = (idToRemove: string) => {
@@ -1439,23 +1951,31 @@ export const LiveAnalysis: React.FC<LiveAnalysisProps> = ({ state: _state, onRef
                 MULTI-VIDEO TRAFFIC DASHBOARD
               </h2>
               <span className="px-2.5 py-0.5 rounded-full bg-cyan-950/90 border border-cyan-500/60 text-cyan-300 font-mono font-bold text-xs">
-                {videoCards.length} {videoCards.length === 1 ? 'VIDEO FEED' : 'VIDEO FEEDS'}
+                {videoCards.length} {videoCards.length === 1 ? 'SOURCE FEED' : 'SOURCE FEEDS'}
               </span>
             </div>
             <p className="text-xs text-slate-400 font-mono mt-0.5">
-              Independent vehicle detection, ByteTrack tracking & road polygon analytics on GPU
+              Multi-source video uploads & live connected cameras with GPU vehicle detection, ByteTrack tracking & road polygon analytics
             </p>
           </div>
         </div>
 
-        {/* Global Action: + Add Video Button */}
-        <div className="flex items-center space-x-3">
+        {/* Global Action: + Add Video & + Add Camera Buttons */}
+        <div className="flex flex-wrap items-center gap-2.5">
           <button
             onClick={handleAddVideo}
-            className="flex items-center px-5 py-2.5 rounded-2xl text-xs font-bold font-mono uppercase tracking-wider bg-gradient-to-r from-cyan-500 to-blue-500 hover:from-cyan-400 hover:to-blue-400 text-slate-950 shadow-lg shadow-cyan-500/25 active:scale-95 transition-all"
+            className="flex items-center px-4 py-2.5 rounded-2xl text-xs font-bold font-mono uppercase tracking-wider bg-gradient-to-r from-cyan-500 to-blue-500 hover:from-cyan-400 hover:to-blue-400 text-slate-950 shadow-lg shadow-cyan-500/25 active:scale-95 transition-all"
           >
             <Plus className="w-4 h-4 mr-1.5 stroke-[2.5]" />
             + Add Video
+          </button>
+
+          <button
+            onClick={handleAddCamera}
+            className="flex items-center px-4 py-2.5 rounded-2xl text-xs font-bold font-mono uppercase tracking-wider bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 text-slate-950 shadow-lg shadow-emerald-500/25 active:scale-95 transition-all"
+          >
+            <Camera className="w-4 h-4 mr-1.5 stroke-[2.5]" />
+            + Add Camera
           </button>
 
           <button
@@ -1471,12 +1991,13 @@ export const LiveAnalysis: React.FC<LiveAnalysisProps> = ({ state: _state, onRef
       {/* ─── RESPONSIVE VIDEO CARDS GRID ───────────────────────────── */}
       <div className={`grid ${gridLayoutClass} gap-6`}>
         {videoCards.map((card, idx) => (
-          <ErrorBoundary key={card.id} fallbackTitle={`Video Card ${idx + 1} Error`}>
+          <ErrorBoundary key={card.id} fallbackTitle={`Source Card ${idx + 1} Error`}>
             <VideoSessionCard
               videoId={card.id}
               index={idx}
               totalCards={videoCards.length}
               initialPreset={card.preset}
+              initialInputMode={card.inputMode}
               onRemove={handleRemoveVideo}
             />
           </ErrorBoundary>
