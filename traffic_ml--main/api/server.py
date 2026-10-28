@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Set, Any
 import shutil
 import cv2
+import time
 
 from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -2248,10 +2249,17 @@ def _get_or_update_signal_status(intersection_id: str, trigger_threshold_sec: fl
         should_trigger = False
         status_label = "Completed"
 
-    start_iso = state["phase_start"].isoformat()
-    end_iso = (state["phase_start"] + timedelta(seconds=duration)).isoformat()
-    amber_end_iso = (state["phase_start"] + timedelta(seconds=duration + amber_sec)).isoformat()
-    all_red_end_iso = (state["phase_start"] + timedelta(seconds=duration + amber_sec + all_red_sec)).isoformat()
+    def _to_iso_utc(dt: datetime) -> str:
+        s = dt.isoformat()
+        if not s.endswith("Z") and "+" not in s:
+            return s + "Z"
+        return s
+
+    start_iso = _to_iso_utc(state["phase_start"])
+    end_iso = _to_iso_utc(state["phase_start"] + timedelta(seconds=duration))
+    amber_end_iso = _to_iso_utc(state["phase_start"] + timedelta(seconds=duration + amber_sec))
+    all_red_end_iso = _to_iso_utc(state["phase_start"] + timedelta(seconds=duration + amber_sec + all_red_sec))
+    server_time_iso = _to_iso_utc(now)
 
     # Map served approaches to actual user-defined road names
     all_roads_map = _live_states_for_intersection(cfg)
@@ -2281,6 +2289,7 @@ def _get_or_update_signal_status(intersection_id: str, trigger_threshold_sec: fl
         "status_label": status_label,
         "phase_start_time": start_iso,
         "phase_end_time": end_iso,
+        "server_time": server_time_iso,
         "duration_sec": round(duration, 1),
         "elapsed_sec": round(elapsed, 1),
         "remaining_green_sec": round(remaining, 1),
@@ -2703,6 +2712,109 @@ def start_signal_timer(intersection_id: str, req: StartSignalRequest):
 
     log.info(f"[SIGNAL START] Started signal {req.signal_number} on {intersection_id}: phase={req.phase_id} duration={req.green_duration_sec}s")
     return _get_or_update_signal_status(intersection_id)
+
+
+# ---------------------------------------------------------------------------
+# Camera Discovery & Video Source Enumeration (Issue 4 & 5)
+# ---------------------------------------------------------------------------
+
+DISCOVERED_CAMERAS_CACHE: Dict[str, Any] = {
+    "timestamp": 0.0,
+    "devices": [],
+}
+CAMERA_CACHE_TTL_SEC = 30.0
+
+def discover_connected_cameras(max_indices: int = 4, force_refresh: bool = False) -> List[dict]:
+    """
+    Enumerate connected camera devices using OpenCV (Issue 4).
+    Tests indices 0..max_indices within a safe scan range, releases VideoCapture immediately,
+    and caches discovery results briefly to prevent performance overhead.
+    """
+    now = time.time()
+    if not force_refresh and (now - DISCOVERED_CAMERAS_CACHE["timestamp"]) < CAMERA_CACHE_TTL_SEC:
+        return DISCOVERED_CAMERAS_CACHE["devices"]
+
+    devices: List[dict] = []
+    if cv2 is not None:
+        for idx in range(max_indices):
+            cap = None
+            try:
+                backend_flag = getattr(cv2, "CAP_DSHOW", cv2.CAP_ANY)
+                cap = cv2.VideoCapture(idx, backend_flag)
+                if cap is not None and cap.isOpened():
+                    devices.append({
+                        "device_id": f"cam_dev_{idx}",
+                        "index": idx,
+                        "name": "Integrated Webcam" if idx == 0 else f"USB / External Camera {idx}",
+                        "device_type": "WEBCAM" if idx == 0 else "USB_OR_VIRTUAL",
+                        "is_available": True,
+                        "resolution": "Ready (Live Stream)",
+                        "source": "backend_host",
+                        "status_text": "Available",
+                    })
+                else:
+                    devices.append({
+                        "device_id": f"cam_dev_{idx}",
+                        "index": idx,
+                        "name": f"Camera Device {idx}",
+                        "device_type": "GENERIC",
+                        "is_available": False,
+                        "resolution": None,
+                        "source": "backend_host",
+                        "status_text": "Unavailable",
+                    })
+            except Exception as e:
+                log.debug(f"Camera index {idx} probe error: {e}")
+            finally:
+                if cap is not None:
+                    cap.release()
+
+    DISCOVERED_CAMERAS_CACHE["timestamp"] = now
+    DISCOVERED_CAMERAS_CACHE["devices"] = devices
+    return devices
+
+
+@app.get("/api/devices/cameras")
+def get_device_cameras(force_refresh: bool = False):
+    """
+    List connected host cameras and processed video sources (Issue 4).
+    Enumerate supported devices on backend host, release immediately, return status.
+    """
+    cameras = discover_connected_cameras(max_indices=4, force_refresh=force_refresh)
+    
+    # Also collect uploaded/processed video sessions
+    processed_sources = []
+    for job_id, job in JOBS.items():
+        processed_sources.append({
+            "source_id": job_id,
+            "name": f"Video Feed: {job.get('source_video', job_id)}",
+            "device_type": "PROCESSED_VIDEO",
+            "is_available": True,
+            "job_id": job_id,
+            "source": "uploaded_file",
+            "status_text": "Ready",
+        })
+        
+    return {
+        "connected_cameras": cameras,
+        "processed_sessions": processed_sources,
+        "scan_count": len(cameras),
+        "source": "backend_host",
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+    }
+
+
+@app.post("/api/devices/cameras/select")
+def select_camera_source(device_id: str = Form(...), camera_index: Optional[int] = Form(None)):
+    """
+    Select an active camera or video source without altering intersection configuration.
+    """
+    return {
+        "status": "SOURCE_SELECTED",
+        "device_id": device_id,
+        "camera_index": camera_index,
+        "message": f"Camera source '{device_id}' selected successfully.",
+    }
 
 
 # ---------------------------------------------------------------------------

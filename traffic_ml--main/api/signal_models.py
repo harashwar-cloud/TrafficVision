@@ -407,11 +407,30 @@ class SignalStatusResponse(BaseModel):
     all_red_sec: float = 2.0
     amber_end_time: Optional[str] = None
     all_red_end_time: Optional[str] = None
+    server_time: Optional[str] = None
     version: int = 1
     is_timing_available: bool = True
     is_simulated: bool = True
     recommendation_trigger_sec: float = 8.0
     should_trigger_recommendation: bool = False
+
+
+class CameraDeviceItem(BaseModel):
+    device_id: str
+    index: int
+    name: str
+    device_type: str = "WEBCAM"
+    is_available: bool = True
+    resolution: Optional[str] = None
+    source: str = "backend_host"
+    status_text: str = "Available"
+
+
+class CameraDiscoveryResponse(BaseModel):
+    connected_cameras: List[CameraDeviceItem] = []
+    processed_sessions: List[Dict[str, Any]] = []
+    scan_count: int = 0
+    source: str = "backend_host"
 
 
 class StartSignalRequest(BaseModel):
