@@ -493,11 +493,39 @@ export interface SignalStatusResponse {
   all_red_sec?: number;
   amber_end_time?: string | null;
   all_red_end_time?: string | null;
+  server_time?: string | null;
   version?: number;
   is_timing_available: boolean;
   is_simulated: boolean;
   recommendation_trigger_sec: number;
   should_trigger_recommendation: boolean;
+}
+
+export interface CameraDeviceItem {
+  device_id: string;
+  index: number;
+  name: string;
+  device_type: string;
+  is_available: boolean;
+  resolution?: string | null;
+  source: string;
+  status_text: string;
+}
+
+export interface CameraDiscoveryResponse {
+  connected_cameras: CameraDeviceItem[];
+  processed_sessions: Array<{
+    source_id: string;
+    name: string;
+    device_type: string;
+    is_available: boolean;
+    job_id?: string;
+    source: string;
+    status_text: string;
+  }>;
+  scan_count: number;
+  source: string;
+  timestamp: string;
 }
 
 export interface StartSignalPayload {

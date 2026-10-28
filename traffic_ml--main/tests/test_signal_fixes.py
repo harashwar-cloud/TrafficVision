@@ -354,6 +354,68 @@ class TestTrafficTwinSignalFixes(unittest.TestCase):
         self.assertTrue(data["is_timing_available"])
         self.assertTrue(data["is_simulated"])
         self.assertIsNotNone(data["phase_end_time"])
+        self.assertTrue(data["phase_end_time"].endswith("Z"))
+        self.assertIn("server_time", data)
+        self.assertTrue(data["server_time"].endswith("Z"))
+        self.assertGreater(data["remaining_green_sec"], 0)
+
+    def test_camera_device_discovery(self):
+        """GET /api/devices/cameras discovers host cameras and processed video feeds."""
+        resp = self.client.get("/api/devices/cameras")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertIn("connected_cameras", data)
+        self.assertIn("processed_sessions", data)
+        self.assertIn("source", data)
+        self.assertEqual(data["source"], "backend_host")
+
+    def test_camera_source_selection(self):
+        """POST /api/devices/cameras/select allows selecting a video source independently."""
+        resp = self.client.post(
+            "/api/devices/cameras/select",
+            data={"device_id": "cam_dev_0", "camera_index": 0}
+        )
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["status"], "SOURCE_SELECTED")
+        self.assertEqual(data["device_id"], "cam_dev_0")
+
+    def test_manual_active_phase_selection_p1_and_p2(self):
+        """Selecting P1 vs P2 sets appropriate served approaches and timing bounds."""
+        # Start P1
+        resp_p1 = self.client.post(
+            f"/api/intersections/{self.intersection_id}/start-signal",
+            json={
+                "intersection_id": self.intersection_id,
+                "phase_id": "P1",
+                "green_duration_sec": 28.0,
+                "signal_number": 1,
+            }
+        )
+        self.assertEqual(resp_p1.status_code, 200)
+        data_p1 = resp_p1.json()
+        self.assertEqual(data_p1["current_phase_id"], "P1")
+        self.assertEqual(data_p1["duration_sec"], 28.0)
+        self.assertEqual(data_p1["signal_state"], "GREEN")
+        self.assertIn("north", data_p1["served_approaches"])
+        self.assertIn("south", data_p1["served_approaches"])
+
+        # Switch / Start P2
+        resp_p2 = self.client.post(
+            f"/api/intersections/{self.intersection_id}/start-signal",
+            json={
+                "intersection_id": self.intersection_id,
+                "phase_id": "P2",
+                "green_duration_sec": 32.0,
+                "signal_number": 2,
+            }
+        )
+        self.assertEqual(resp_p2.status_code, 200)
+        data_p2 = resp_p2.json()
+        self.assertEqual(data_p2["current_phase_id"], "P2")
+        self.assertEqual(data_p2["duration_sec"], 32.0)
+        self.assertIn("east", data_p2["served_approaches"])
+        self.assertIn("west", data_p2["served_approaches"])
 
 
 if __name__ == "__main__":

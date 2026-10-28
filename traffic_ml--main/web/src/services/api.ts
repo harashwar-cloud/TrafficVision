@@ -556,6 +556,26 @@ class TrafficApiService {
     }
     return await res.json();
   }
+
+  async getConnectedCameras(forceRefresh: boolean = false): Promise<any> {
+    const res = await fetch(`${this.baseUrl}/api/devices/cameras?force_refresh=${forceRefresh}`);
+    if (!res.ok) throw new Error('Failed to retrieve connected cameras');
+    return await res.json();
+  }
+
+  async selectCameraSource(deviceId: string, cameraIndex?: number): Promise<any> {
+    const formData = new FormData();
+    formData.append('device_id', deviceId);
+    if (cameraIndex !== undefined) {
+      formData.append('camera_index', cameraIndex.toString());
+    }
+    const res = await fetch(`${this.baseUrl}/api/devices/cameras/select`, {
+      method: 'POST',
+      body: formData,
+    });
+    if (!res.ok) throw new Error(`Failed to select camera ${deviceId}`);
+    return await res.json();
+  }
 }
 
 export const api = new TrafficApiService();

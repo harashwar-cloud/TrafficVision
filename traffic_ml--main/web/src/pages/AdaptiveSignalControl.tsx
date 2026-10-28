@@ -14,6 +14,12 @@ import {
   Search,
   CheckCheck,
   Compass,
+  Camera,
+  Check,
+  ArrowUp,
+  ArrowDown,
+  ArrowLeft,
+  ArrowRight,
 } from 'lucide-react';
 import { api } from '../services/api';
 import { useVideoProcessing } from '../context/VideoProcessingContext';
@@ -30,6 +36,7 @@ import type {
   VideoReadinessReport,
   SignalStatusResponse,
   ManualSignalSelection,
+  CameraDeviceItem,
 } from '../types';
 
 export const AdaptiveSignalControl: React.FC = () => {
@@ -46,13 +53,20 @@ export const AdaptiveSignalControl: React.FC = () => {
   const [manualSelection, setManualSelection] = useState<ManualSignalSelection | null>(null);
   const [auditLog, setAuditLog] = useState<AuditLogEntry[]>([]);
 
-  // Workflow Step 1 & 2 Configuration States
+  // Video Source & Connected Camera States (Issue 4 & 5)
+  const [cameraDevices, setCameraDevices] = useState<CameraDeviceItem[]>([]);
+  const [processedVideoSessions, setProcessedVideoSessions] = useState<any[]>([]);
+  const [browserWebcams, setBrowserWebcams] = useState<MediaDeviceInfo[]>([]);
+  const [selectedVideoSourceId, setSelectedVideoSourceId] = useState<string>('session_cam5');
+  const [isLoadingCameras, setIsLoadingCameras] = useState<boolean>(false);
+
+  // Workflow Step 1 & 2 Configuration States (Active Phase Selector - Issue 2)
   const [configuredSignalNum, setConfiguredSignalNum] = useState<number>(1);
   const [configuredPhaseId, setConfiguredPhaseId] = useState<string>('P1');
   const [configuredGreenSec, setConfiguredGreenSec] = useState<number>(30);
   const [configuredApproaches, setConfiguredApproaches] = useState<string[]>(['north', 'south']);
 
-  // Authoritative Live Clock Countdown
+  // Authoritative Live Clock Countdown (Issue 1)
   const [liveRemainingSec, setLiveRemainingSec] = useState<number | null>(null);
 
   // Actions & Modals
@@ -93,7 +107,39 @@ export const AdaptiveSignalControl: React.FC = () => {
     fetchIntersections();
   }, []);
 
-  // 2. Fetch full intersection data
+  // 2. Fetch connected computer cameras & video sources (Issue 4)
+  const fetchCameraSources = useCallback(async (forceRefresh = false) => {
+    setIsLoadingCameras(true);
+    try {
+      const data = await api.getConnectedCameras(forceRefresh);
+      if (data.connected_cameras) {
+        setCameraDevices(data.connected_cameras);
+      }
+      if (data.processed_sessions) {
+        setProcessedVideoSessions(data.processed_sessions);
+      }
+    } catch (err) {
+      console.warn('Failed to discover host cameras:', err);
+    } finally {
+      setIsLoadingCameras(false);
+    }
+
+    // Query browser local cameras if supported
+    if (typeof navigator !== 'undefined' && navigator.mediaDevices?.enumerateDevices) {
+      try {
+        const devs = await navigator.mediaDevices.enumerateDevices();
+        setBrowserWebcams(devs.filter((d) => d.kind === 'videoinput'));
+      } catch (e) {
+        console.warn('Browser webcam enumeration notice:', e);
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchCameraSources();
+  }, [fetchCameraSources]);
+
+  // 3. Fetch full intersection data
   const fetchIntersectionData = useCallback(async (intId: string) => {
     if (!intId) return;
     setActionError(null);
@@ -133,32 +179,55 @@ export const AdaptiveSignalControl: React.FC = () => {
     fetchIntersectionData(selectedIntersectionId);
   }, [selectedIntersectionId, fetchIntersectionData]);
 
-  // 3. Authoritative Signal Clock Countdown Effect (strictly derived from backend phase timestamps)
+  // 4. Authoritative Signal Clock Countdown Effect (Issue 1 — Zero Drift & No 00:00 Reset)
   useEffect(() => {
     if (!signalStatus?.phase_end_time || !signalStatus?.is_timing_available) {
       setLiveRemainingSec(null);
       return;
     }
 
+    const parseUtc = (iso: string | null | undefined): number => {
+      if (!iso) return 0;
+      const normalized = iso.endsWith('Z') || iso.includes('+') ? iso : iso + 'Z';
+      const parsed = Date.parse(normalized);
+      return isNaN(parsed) ? 0 : parsed;
+    };
+
     const updateCountdown = () => {
-      const now = Date.now();
-      const greenEnd = new Date(signalStatus.phase_end_time!).getTime();
+      // Synchronize with server clock offset to prevent client clock skew
+      const serverEpoch = signalStatus.server_time ? parseUtc(signalStatus.server_time) : 0;
+      const clientOffset = serverEpoch > 0 ? Date.now() - serverEpoch : 0;
+      const syncedNow = Date.now() - clientOffset;
+
+      const greenEnd = parseUtc(signalStatus.phase_end_time);
       const amberEnd = signalStatus.amber_end_time
-        ? new Date(signalStatus.amber_end_time).getTime()
+        ? parseUtc(signalStatus.amber_end_time)
         : greenEnd + (signalStatus.amber_sec || 3.0) * 1000;
       const allRedEnd = signalStatus.all_red_end_time
-        ? new Date(signalStatus.all_red_end_time).getTime()
+        ? parseUtc(signalStatus.all_red_end_time)
         : amberEnd + (signalStatus.all_red_sec || 2.0) * 1000;
 
-      if (now < greenEnd) {
-        setLiveRemainingSec(Math.max(0, (greenEnd - now) / 1000));
-      } else if (now < amberEnd) {
-        setLiveRemainingSec(Math.max(0, (amberEnd - now) / 1000));
-      } else if (now < allRedEnd) {
-        setLiveRemainingSec(Math.max(0, (allRedEnd - now) / 1000));
+      let remaining = 0;
+      if (syncedNow < greenEnd) {
+        remaining = Math.max(0, (greenEnd - syncedNow) / 1000);
+      } else if (syncedNow < amberEnd) {
+        remaining = Math.max(0, (amberEnd - syncedNow) / 1000);
+      } else if (syncedNow < allRedEnd) {
+        remaining = Math.max(0, (allRedEnd - syncedNow) / 1000);
       } else {
-        setLiveRemainingSec(0);
+        // Safe fallback to backend remaining_green_sec if phase is still marked running
+        if (
+          signalStatus.remaining_green_sec !== undefined &&
+          signalStatus.remaining_green_sec !== null &&
+          signalStatus.remaining_green_sec > 0 &&
+          signalStatus.signal_state === 'GREEN'
+        ) {
+          remaining = signalStatus.remaining_green_sec;
+        } else {
+          remaining = 0;
+        }
       }
+      setLiveRemainingSec(remaining);
     };
 
     updateCountdown();
@@ -168,12 +237,15 @@ export const AdaptiveSignalControl: React.FC = () => {
     signalStatus?.phase_end_time,
     signalStatus?.amber_end_time,
     signalStatus?.all_red_end_time,
+    signalStatus?.server_time,
     signalStatus?.is_timing_available,
+    signalStatus?.signal_state,
+    signalStatus?.remaining_green_sec,
     signalStatus?.amber_sec,
     signalStatus?.all_red_sec,
   ]);
 
-  // 4. Polling for Live Analytics and Authoritative Clock & 8s Recommendation Trigger
+  // 5. Polling for Live Telemetry & 8s Recommendation Trigger
   useEffect(() => {
     if (!autoRefresh || !selectedIntersectionId) return;
     const pollInterval = videoProc.isAnalyzing ? 1500 : 3000;
@@ -206,7 +278,7 @@ export const AdaptiveSignalControl: React.FC = () => {
         }
         if (readiness.status === 'fulfilled') setVideoReadiness(readiness.value);
       } catch (err) {
-        console.warn('Live polling failed', err);
+        console.warn('Live polling notice:', err);
       }
     }, pollInterval);
 
@@ -218,7 +290,7 @@ export const AdaptiveSignalControl: React.FC = () => {
     return analytics?.approach_demands || recommendation?.approach_demands || [];
   }, [analytics, recommendation]);
 
-  // Phase lookup helper
+  // Available phases for selected intersection
   const availablePhases = useMemo(() => {
     return config?.phases || [
       {
@@ -310,7 +382,7 @@ export const AdaptiveSignalControl: React.FC = () => {
     }
   };
 
-  // Handler for Green Extension (ISSUE 5 & 6)
+  // Handler for Green Extension (Issue 3 & 7)
   const handleExtendGreen = async (seconds: number) => {
     if (!signalStatus || isExtendingGreen) return;
     setIsExtendingGreen(true);
@@ -413,10 +485,10 @@ export const AdaptiveSignalControl: React.FC = () => {
     }
   };
 
-  // Helper formatting for countdown digits (e.g. 00:25)
+  // Helper formatting for countdown digits (e.g. 00:28) - Issue 1
   const formatCountdown = (seconds: number | null): string => {
-    if (seconds === null || isNaN(seconds)) return '--:--';
-    const totalSec = Math.max(0, Math.ceil(seconds));
+    if (seconds === null || isNaN(seconds) || seconds < 0) return '00:00';
+    const totalSec = Math.ceil(seconds);
     const m = Math.floor(totalSec / 60);
     const s = totalSec % 60;
     return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
@@ -484,7 +556,9 @@ export const AdaptiveSignalControl: React.FC = () => {
         </div>
       )}
 
-      {/* Header Bar */}
+      {/* =========================================================================
+          TOP CONTROL BAR: SEPARATE VIDEO SOURCE & INTERSECTION SELECTORS (ISSUE 4 & 5)
+         ========================================================================= */}
       <div
         style={{
           backgroundColor: 'var(--bg-surface)',
@@ -536,46 +610,134 @@ export const AdaptiveSignalControl: React.FC = () => {
               </span>
             </div>
             <p style={{ margin: '4px 0 0 0', fontSize: '13px', color: 'var(--text-muted)' }}>
-              Live authoritative signal controller & automated traffic-demand decision support.
+              Independent Camera Discovery & Intersection Signal Optimization.
             </p>
           </div>
         </div>
 
-        {/* Intersection Selector & Refresh */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-          {videoReadiness && (
-            <span
+        {/* Dual Selectors: 1. Video Source / Camera, 2. Intersection (Issue 4 & 5) */}
+        <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '16px' }}>
+          {/* 1. Camera / Video Source Selector */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <span style={{ fontSize: '12px', fontWeight: 700, color: '#38bdf8', display: 'flex', alignItems: 'center', gap: '4px' }}>
+              <Camera size={14} /> Source:
+            </span>
+            <select
+              value={selectedVideoSourceId}
+              onChange={(e) => setSelectedVideoSourceId(e.target.value)}
               style={{
-                fontSize: '11px',
-                fontWeight: 700,
-                color: videoReadiness.is_ready ? '#10b981' : '#f59e0b',
-                backgroundColor: videoReadiness.is_ready ? 'rgba(16, 185, 129, 0.12)' : 'rgba(245, 158, 11, 0.12)',
-                padding: '4px 8px',
-                borderRadius: '6px',
+                backgroundColor: '#0f172a',
+                border: '1px solid rgba(56, 189, 248, 0.4)',
+                borderRadius: '8px',
+                padding: '8px 12px',
+                color: '#f8fafc',
+                fontSize: '13px',
+                fontWeight: 600,
+                outline: 'none',
               }}
             >
-              Feeds: {videoReadiness.coverage_status} ({videoReadiness.valid_session_count} active)
-            </span>
-          )}
+              <optgroup label="Connected Computer Cameras (Backend Host)" style={{ backgroundColor: '#0f172a', color: '#38bdf8' }}>
+                {cameraDevices.map((cam) => (
+                  <option
+                    key={cam.device_id}
+                    value={cam.device_id}
+                    style={{ backgroundColor: '#0f172a', color: '#f8fafc', padding: '6px' }}
+                  >
+                    {cam.name} (Index {cam.index}) — {cam.status_text}
+                  </option>
+                ))}
+              </optgroup>
 
+              <optgroup label="Processed Video Sessions" style={{ backgroundColor: '#0f172a', color: '#10b981' }}>
+                <option value="session_cam5" style={{ backgroundColor: '#0f172a', color: '#f8fafc' }}>
+                  Processed Video: cam_5.mp4 (4-Leg Fisheye) — Ready
+                </option>
+                {processedVideoSessions.map((ps) => (
+                  <option
+                    key={ps.source_id}
+                    value={ps.source_id}
+                    style={{ backgroundColor: '#0f172a', color: '#f8fafc' }}
+                  >
+                    {ps.name} — {ps.status_text}
+                  </option>
+                ))}
+              </optgroup>
+
+              {browserWebcams.length > 0 && (
+                <optgroup label="Browser Local Webcams" style={{ backgroundColor: '#0f172a', color: '#a855f7' }}>
+                  {browserWebcams.map((bw, idx) => (
+                    <option
+                      key={bw.deviceId || idx}
+                      value={`browser_${bw.deviceId || idx}`}
+                      style={{ backgroundColor: '#0f172a', color: '#f8fafc' }}
+                    >
+                      Browser Cam: {bw.label || `Device ${idx + 1}`}
+                    </option>
+                  ))}
+                </optgroup>
+              )}
+            </select>
+
+            <button
+              onClick={() => fetchCameraSources(true)}
+              disabled={isLoadingCameras}
+              title="Rescan connected cameras on host"
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: '4px',
+                padding: '8px 10px',
+                borderRadius: '8px',
+                border: '1px solid var(--border-subtle)',
+                backgroundColor: 'var(--bg-elevated)',
+                color: 'var(--text-muted)',
+                fontSize: '11px',
+                fontWeight: 600,
+                cursor: isLoadingCameras ? 'not-allowed' : 'pointer',
+              }}
+            >
+              <RefreshCw size={12} className={isLoadingCameras ? 'animate-spin' : ''} />
+              <span>Scan</span>
+            </button>
+          </div>
+
+          {/* 2. Intersection Selector */}
           <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-            <span style={{ fontSize: '12px', fontWeight: 600, color: 'var(--text-muted)' }}>Intersection:</span>
+            {videoReadiness && (
+              <span
+                style={{
+                  fontSize: '11px',
+                  fontWeight: 700,
+                  color: videoReadiness.is_ready ? '#10b981' : '#f59e0b',
+                  backgroundColor: videoReadiness.is_ready ? 'rgba(16, 185, 129, 0.12)' : 'rgba(245, 158, 11, 0.12)',
+                  padding: '4px 8px',
+                  borderRadius: '6px',
+                }}
+              >
+                Feeds: {videoReadiness.coverage_status} ({videoReadiness.valid_session_count} valid)
+              </span>
+            )}
+            <span style={{ fontSize: '12px', fontWeight: 700, color: 'var(--text-muted)' }}>Intersection:</span>
             <select
               value={selectedIntersectionId}
               onChange={(e) => setSelectedIntersectionId(e.target.value)}
               style={{
-                backgroundColor: 'var(--bg-elevated)',
+                backgroundColor: '#0f172a',
                 border: '1px solid var(--border-subtle)',
                 borderRadius: '8px',
                 padding: '8px 12px',
-                color: 'var(--text-primary)',
+                color: '#f8fafc',
                 fontSize: '13px',
                 fontWeight: 600,
                 outline: 'none',
               }}
             >
               {intersections.map((it) => (
-                <option key={it.intersection_id} value={it.intersection_id}>
+                <option
+                  key={it.intersection_id}
+                  value={it.intersection_id}
+                  style={{ backgroundColor: '#0f172a', color: '#f8fafc' }}
+                >
                   {it.name} ({it.intersection_id})
                 </option>
               ))}
@@ -598,32 +760,11 @@ export const AdaptiveSignalControl: React.FC = () => {
           >
             {autoRefresh ? 'Live Sync: ON' : 'Live Sync: PAUSED'}
           </button>
-
-          <button
-            onClick={() => fetchIntersectionData(selectedIntersectionId)}
-            title="Refresh Live Data"
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: '6px',
-              padding: '8px 14px',
-              borderRadius: '8px',
-              border: '1px solid var(--border-subtle)',
-              backgroundColor: 'var(--bg-elevated)',
-              color: 'var(--text-primary)',
-              fontSize: '12px',
-              fontWeight: 600,
-              cursor: 'pointer',
-            }}
-          >
-            <RefreshCw size={14} />
-            <span>Refresh</span>
-          </button>
         </div>
       </div>
 
       {/* =========================================================================
-          SECTION 2: THREE-STEP SIGNAL CONTROL WORKFLOW
+          SECTION 2: THREE-STEP SIGNAL CONTROL WORKFLOW (ISSUE 2, 3)
          ========================================================================= */}
       <div
         style={{
@@ -632,7 +773,7 @@ export const AdaptiveSignalControl: React.FC = () => {
           gap: '16px',
         }}
       >
-        {/* Step 1 — Configure Signal */}
+        {/* Step 1 — Configure Signal & ACTIVE PHASE SELECTOR */}
         <div
           style={{
             backgroundColor: 'var(--bg-surface)',
@@ -642,6 +783,7 @@ export const AdaptiveSignalControl: React.FC = () => {
             display: 'flex',
             flexDirection: 'column',
             gap: '14px',
+            overflow: 'visible',
           }}
         >
           <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
@@ -663,74 +805,122 @@ export const AdaptiveSignalControl: React.FC = () => {
             </div>
             <div>
               <div style={{ fontSize: '14px', fontWeight: 700 }}>Step 1 — Configure Signal</div>
-              <div style={{ fontSize: '11px', color: 'var(--text-muted)' }}>Choose signal, phase & green duration</div>
+              <div style={{ fontSize: '11px', color: 'var(--text-muted)' }}>Choose signal, manual active phase & green duration</div>
             </div>
           </div>
 
-          {/* Signal Number & Phase Selection */}
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 2fr', gap: '10px' }}>
-            <div>
-              <label style={{ fontSize: '11px', fontWeight: 700, color: 'var(--text-muted)', display: 'block', marginBottom: '6px' }}>
-                SIGNAL NO.
-              </label>
-              <select
-                value={configuredSignalNum}
-                onChange={(e) => setConfiguredSignalNum(parseInt(e.target.value, 10))}
-                style={{
-                  width: '100%',
-                  backgroundColor: 'var(--bg-elevated)',
-                  border: '1px solid var(--border-subtle)',
-                  borderRadius: '6px',
-                  padding: '8px 10px',
-                  color: 'var(--text-primary)',
-                  fontSize: '13px',
-                  fontWeight: 600,
-                }}
-              >
-                <option value={1}>Signal 1</option>
-                <option value={2}>Signal 2</option>
-                <option value={3}>Signal 3</option>
-                <option value={4}>Signal 4</option>
-              </select>
+          {/* Signal Number */}
+          <div>
+            <label style={{ fontSize: '11px', fontWeight: 800, color: 'var(--text-muted)', display: 'block', marginBottom: '6px' }}>
+              SIGNAL NUMBER
+            </label>
+            <select
+              value={configuredSignalNum}
+              onChange={(e) => setConfiguredSignalNum(parseInt(e.target.value, 10))}
+              style={{
+                width: '100%',
+                backgroundColor: '#0f172a',
+                border: '1px solid var(--border-subtle)',
+                borderRadius: '6px',
+                padding: '8px 10px',
+                color: '#f8fafc',
+                fontSize: '13px',
+                fontWeight: 600,
+              }}
+            >
+              <option value={1} style={{ backgroundColor: '#0f172a', color: '#f8fafc' }}>Signal 1</option>
+              <option value={2} style={{ backgroundColor: '#0f172a', color: '#f8fafc' }}>Signal 2</option>
+              <option value={3} style={{ backgroundColor: '#0f172a', color: '#f8fafc' }}>Signal 3</option>
+              <option value={4} style={{ backgroundColor: '#0f172a', color: '#f8fafc' }}>Signal 4</option>
+            </select>
+          </div>
+
+          {/* ACTIVE PHASE SELECTOR (ISSUE 2 - Dedicated, High-Contrast & Unambiguous) */}
+          <div>
+            <label style={{ fontSize: '11px', fontWeight: 800, color: '#38bdf8', display: 'block', marginBottom: '8px', letterSpacing: '0.04em' }}>
+              ACTIVE PHASE (MANUAL SELECTION)
+            </label>
+
+            {/* Interactive Phase Cards for 1-Click Selection */}
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px', marginBottom: '8px' }}>
+              {availablePhases.map((ph) => {
+                const isSelected = ph.phase_id === configuredPhaseId;
+                return (
+                  <button
+                    key={ph.phase_id}
+                    type="button"
+                    onClick={() => {
+                      setConfiguredPhaseId(ph.phase_id);
+                      if (ph.served_approaches) {
+                        setConfiguredApproaches(ph.served_approaches);
+                      }
+                    }}
+                    style={{
+                      textAlign: 'left',
+                      padding: '10px 12px',
+                      borderRadius: '8px',
+                      border: isSelected ? '2px solid #38bdf8' : '1px solid var(--border-subtle)',
+                      backgroundColor: isSelected ? 'rgba(56, 189, 248, 0.15)' : 'var(--bg-elevated)',
+                      color: isSelected ? '#ffffff' : 'var(--text-primary)',
+                      cursor: 'pointer',
+                      transition: 'all 0.15s ease',
+                    }}
+                  >
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <span style={{ fontSize: '13px', fontWeight: 900, color: isSelected ? '#38bdf8' : 'var(--text-muted)' }}>
+                        {ph.phase_id}
+                      </span>
+                      {isSelected && <Check size={14} style={{ color: '#38bdf8' }} />}
+                    </div>
+                    <div style={{ fontSize: '12px', fontWeight: 700, marginTop: '2px', lineHeight: 1.2 }}>
+                      {ph.phase_name}
+                    </div>
+                    <div style={{ fontSize: '10px', color: 'var(--text-muted)', marginTop: '4px' }}>
+                      {(ph.served_approaches || []).map((a) => getRoadName(a)).join(' & ')}
+                    </div>
+                  </button>
+                );
+              })}
             </div>
 
-            <div>
-              <label style={{ fontSize: '11px', fontWeight: 700, color: 'var(--text-muted)', display: 'block', marginBottom: '6px' }}>
-                ACTIVE PHASE
-              </label>
-              <select
-                value={configuredPhaseId}
-                onChange={(e) => {
-                  const pid = e.target.value;
-                  setConfiguredPhaseId(pid);
-                  const p = availablePhases.find((ph) => ph.phase_id === pid);
-                  if (p && p.served_approaches) {
-                    setConfiguredApproaches(p.served_approaches);
-                  }
-                }}
-                style={{
-                  width: '100%',
-                  backgroundColor: 'var(--bg-elevated)',
-                  border: '1px solid var(--border-subtle)',
-                  borderRadius: '6px',
-                  padding: '8px 10px',
-                  color: 'var(--text-primary)',
-                  fontSize: '13px',
-                  fontWeight: 600,
-                }}
-              >
-                {availablePhases.map((ph) => (
-                  <option key={ph.phase_id} value={ph.phase_id}>
-                    {ph.phase_id}: {ph.phase_name}
-                  </option>
-                ))}
-              </select>
-            </div>
+            {/* Accessible Native Select with Explicit Dark Contrast */}
+            <select
+              value={configuredPhaseId}
+              onChange={(e) => {
+                const pid = e.target.value;
+                setConfiguredPhaseId(pid);
+                const p = availablePhases.find((ph) => ph.phase_id === pid);
+                if (p && p.served_approaches) {
+                  setConfiguredApproaches(p.served_approaches);
+                }
+              }}
+              style={{
+                width: '100%',
+                backgroundColor: '#0f172a',
+                color: '#f8fafc',
+                border: '1px solid var(--border-subtle)',
+                borderRadius: '6px',
+                padding: '8px 10px',
+                fontSize: '12px',
+                fontWeight: 600,
+                outline: 'none',
+              }}
+            >
+              {availablePhases.map((ph) => (
+                <option
+                  key={ph.phase_id}
+                  value={ph.phase_id}
+                  style={{ backgroundColor: '#0f172a', color: '#f8fafc', padding: '6px' }}
+                >
+                  {ph.phase_id}: {ph.phase_name} (Serves: {(ph.served_approaches || []).map((a) => getRoadName(a)).join(', ')})
+                </option>
+              ))}
+            </select>
           </div>
 
           {/* Road Approaches Served (Actual User-Defined Road Names) */}
           <div>
-            <label style={{ fontSize: '11px', fontWeight: 700, color: 'var(--text-muted)', display: 'block', marginBottom: '6px' }}>
+            <label style={{ fontSize: '11px', fontWeight: 800, color: 'var(--text-muted)', display: 'block', marginBottom: '6px' }}>
               ROADS RECEIVING GREEN
             </label>
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
@@ -760,8 +950,8 @@ export const AdaptiveSignalControl: React.FC = () => {
           {/* Green Duration in Seconds */}
           <div>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
-              <label style={{ fontSize: '11px', fontWeight: 700, color: 'var(--text-muted)' }}>GREEN DURATION (SEC)</label>
-              <span style={{ fontSize: '13px', fontWeight: 800, color: '#38bdf8' }}>{configuredGreenSec}s</span>
+              <label style={{ fontSize: '11px', fontWeight: 800, color: 'var(--text-muted)' }}>GREEN DURATION</label>
+              <span style={{ fontSize: '14px', fontWeight: 800, color: '#38bdf8' }}>{configuredGreenSec}s</span>
             </div>
             <input
               type="range"
@@ -821,7 +1011,7 @@ export const AdaptiveSignalControl: React.FC = () => {
                 backgroundColor: 'var(--bg-elevated)',
                 border: '1px solid var(--border-subtle)',
                 borderRadius: '8px',
-                padding: '12px 14px',
+                padding: '14px',
                 fontSize: '12px',
                 display: 'flex',
                 flexDirection: 'column',
@@ -837,11 +1027,19 @@ export const AdaptiveSignalControl: React.FC = () => {
                 <span style={{ fontWeight: 700, color: '#38bdf8' }}>Signal {configuredSignalNum}</span>
               </div>
               <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                <span style={{ color: 'var(--text-muted)' }}>Phase Plan:</span>
-                <span style={{ fontWeight: 700 }}>{activeConfigPhase?.phase_name}</span>
+                <span style={{ color: 'var(--text-muted)' }}>Active Phase:</span>
+                <span style={{ fontWeight: 700, color: '#10b981' }}>
+                  {activeConfigPhase?.phase_name} ({configuredPhaseId})
+                </span>
               </div>
               <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                <span style={{ color: 'var(--text-muted)' }}>Approved Green:</span>
+                <span style={{ color: 'var(--text-muted)' }}>Roads Receiving Green:</span>
+                <span style={{ fontWeight: 600, color: '#38bdf8', maxWidth: '180px', textAlign: 'right' }}>
+                  {(activeConfigPhase?.served_approaches || []).map((a) => getRoadName(a)).join(', ')}
+                </span>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <span style={{ color: 'var(--text-muted)' }}>Approved Green Duration:</span>
                 <span style={{ fontWeight: 800, color: '#10b981' }}>{configuredGreenSec} seconds</span>
               </div>
               <div style={{ display: 'flex', justifyContent: 'space-between', borderTop: '1px solid var(--border-subtle)', paddingTop: '6px' }}>
@@ -910,7 +1108,7 @@ export const AdaptiveSignalControl: React.FC = () => {
               </div>
               <div>
                 <div style={{ fontSize: '14px', fontWeight: 700 }}>Step 3 — Monitor and Decide</div>
-                <div style={{ fontSize: '11px', color: 'var(--text-muted)' }}>Watch live countdown & respond to 8s suggestions</div>
+                <div style={{ fontSize: '11px', color: 'var(--text-muted)' }}>Live countdown & 8s pre-transition recommendations</div>
               </div>
             </div>
 
@@ -925,7 +1123,7 @@ export const AdaptiveSignalControl: React.FC = () => {
                 gap: '8px',
               }}
             >
-              <div style={{ fontSize: '12px', color: 'var(--text-muted)' }}>Active Status:</div>
+              <div style={{ fontSize: '12px', color: 'var(--text-muted)' }}>Authoritative State:</div>
               <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                 <span
                   style={{
@@ -940,8 +1138,8 @@ export const AdaptiveSignalControl: React.FC = () => {
                   {signalStatus?.status_label || 'Signal Timer Running'}
                 </span>
               </div>
-              <div style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: '4px' }}>
-                Automatic recommendation generates 8s before green ends. You can approve or extend below without leaving this view.
+              <div style={{ fontSize: '11px', color: 'var(--text-muted)', marginTop: '4px' }}>
+                Next suggestion generates 8s before green ends. You can approve or add extension below without navigating away.
               </div>
             </div>
           </div>
@@ -996,7 +1194,7 @@ export const AdaptiveSignalControl: React.FC = () => {
       </div>
 
       {/* =========================================================================
-          SECTION 3: LARGE, CLEAR TRAFFIC SIGNAL PANEL
+          SECTION 3: LARGE VISUAL TRAFFIC SIGNAL PANEL & SCHEMATIC (ISSUE 1, 2, 3)
          ========================================================================= */}
       <div
         style={{
@@ -1006,7 +1204,7 @@ export const AdaptiveSignalControl: React.FC = () => {
           padding: '24px',
           boxShadow: '0 8px 30px rgba(0, 0, 0, 0.35)',
           display: 'grid',
-          gridTemplateColumns: 'minmax(120px, 140px) 1fr',
+          gridTemplateColumns: '120px 1fr 200px',
           gap: '24px',
           alignItems: 'center',
         }}
@@ -1029,8 +1227,8 @@ export const AdaptiveSignalControl: React.FC = () => {
           <div
             title="Red Lamp (Clearance / Stop)"
             style={{
-              width: '56px',
-              height: '56px',
+              width: '52px',
+              height: '52px',
               borderRadius: '50%',
               backgroundColor: currentSignalState === 'RED' ? '#ef4444' : '#281114',
               boxShadow: currentSignalState === 'RED' ? '0 0 24px #ef4444, inset 0 0 8px #fca5a5' : 'inset 0 2px 6px rgba(0,0,0,0.8)',
@@ -1043,8 +1241,8 @@ export const AdaptiveSignalControl: React.FC = () => {
           <div
             title="Amber Lamp (Transitioning)"
             style={{
-              width: '56px',
-              height: '56px',
+              width: '52px',
+              height: '52px',
               borderRadius: '50%',
               backgroundColor: currentSignalState === 'AMBER' ? '#f59e0b' : '#2d2208',
               boxShadow: currentSignalState === 'AMBER' ? '0 0 24px #f59e0b, inset 0 0 8px #fde68a' : 'inset 0 2px 6px rgba(0,0,0,0.8)',
@@ -1057,8 +1255,8 @@ export const AdaptiveSignalControl: React.FC = () => {
           <div
             title="Green Lamp (Active Green)"
             style={{
-              width: '56px',
-              height: '56px',
+              width: '52px',
+              height: '52px',
               borderRadius: '50%',
               backgroundColor: currentSignalState === 'GREEN' ? '#10b981' : '#09251a',
               boxShadow: currentSignalState === 'GREEN' ? '0 0 24px #10b981, inset 0 0 8px #6ee7b7' : 'inset 0 2px 6px rgba(0,0,0,0.8)',
@@ -1068,7 +1266,7 @@ export const AdaptiveSignalControl: React.FC = () => {
           />
         </div>
 
-        {/* Signal Information, Big Digits & Controls */}
+        {/* Signal Information & Large Digits (Issue 1) */}
         <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
           {/* Top Identifier & Badges */}
           <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'space-between', alignItems: 'center', gap: '8px' }}>
@@ -1113,7 +1311,7 @@ export const AdaptiveSignalControl: React.FC = () => {
           </div>
 
           {/* Current Phase & Roads Receiving Green */}
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '24px', fontSize: '13px' }}>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '20px', fontSize: '13px' }}>
             <div>
               <span style={{ color: 'var(--text-muted)' }}>Current Phase: </span>
               <strong style={{ color: 'var(--text-primary)' }}>
@@ -1129,7 +1327,7 @@ export const AdaptiveSignalControl: React.FC = () => {
             </div>
           </div>
 
-          {/* Large Countdown Display */}
+          {/* Large Countdown Display (Issue 1) */}
           <div
             style={{
               backgroundColor: 'var(--bg-elevated)',
@@ -1166,7 +1364,7 @@ export const AdaptiveSignalControl: React.FC = () => {
             </div>
 
             {/* In-Panel Green Extension Quick Controls */}
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', minWidth: '220px' }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', minWidth: '200px' }}>
               <div style={{ fontSize: '11px', fontWeight: 700, color: 'var(--text-muted)' }}>
                 EXTEND GREEN TIME (ADDITIVE)
               </div>
@@ -1181,7 +1379,7 @@ export const AdaptiveSignalControl: React.FC = () => {
                       backgroundColor: 'var(--bg-surface)',
                       border: '1px solid var(--border-subtle)',
                       borderRadius: '6px',
-                      padding: '8px 12px',
+                      padding: '8px 10px',
                       color: 'var(--text-primary)',
                       fontSize: '12px',
                       fontWeight: 700,
@@ -1194,7 +1392,7 @@ export const AdaptiveSignalControl: React.FC = () => {
                 ))}
               </div>
               <div style={{ fontSize: '10px', color: 'var(--text-muted)' }}>
-                Formula: newRemaining = currentRemaining + approvedExtension
+                Formula: newEndTime = currentEndTime + extension
               </div>
             </div>
           </div>
@@ -1202,7 +1400,7 @@ export const AdaptiveSignalControl: React.FC = () => {
           {/* Simple Cycle Progress Bar */}
           <div>
             <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: 'var(--text-muted)', marginBottom: '4px' }}>
-              <span>Phase Progress</span>
+              <span>Phase Stage Progress</span>
               <span>{Math.round(progressPct)}% elapsed</span>
             </div>
             <div
@@ -1223,6 +1421,82 @@ export const AdaptiveSignalControl: React.FC = () => {
                 }}
               />
             </div>
+          </div>
+        </div>
+
+        {/* Visual Intersection Movement Schematic (Issue 2) */}
+        <div
+          style={{
+            backgroundColor: '#0b1329',
+            border: '1px solid #1e293b',
+            borderRadius: '12px',
+            padding: '14px',
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            justifyContent: 'center',
+            height: '100%',
+          }}
+        >
+          <div style={{ fontSize: '10px', fontWeight: 800, color: 'var(--text-muted)', marginBottom: '8px', textTransform: 'uppercase' }}>
+            Intersection Movement
+          </div>
+
+          <div
+            style={{
+              position: 'relative',
+              width: '120px',
+              height: '120px',
+              backgroundColor: '#0f172a',
+              borderRadius: '8px',
+              border: '2px solid #334155',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+            }}
+          >
+            {/* North-South corridor */}
+            <div
+              style={{
+                position: 'absolute',
+                top: 0,
+                bottom: 0,
+                width: '32px',
+                backgroundColor: configuredPhaseId === 'P1' ? 'rgba(16, 185, 129, 0.25)' : '#1e293b',
+                borderLeft: configuredPhaseId === 'P1' ? '2px dashed #10b981' : '1px dashed #475569',
+                borderRight: configuredPhaseId === 'P1' ? '2px dashed #10b981' : '1px dashed #475569',
+              }}
+            />
+
+            {/* East-West corridor */}
+            <div
+              style={{
+                position: 'absolute',
+                left: 0,
+                right: 0,
+                height: '32px',
+                backgroundColor: configuredPhaseId === 'P2' ? 'rgba(16, 185, 129, 0.25)' : '#1e293b',
+                borderTop: configuredPhaseId === 'P2' ? '2px dashed #10b981' : '1px dashed #475569',
+                borderBottom: configuredPhaseId === 'P2' ? '2px dashed #10b981' : '1px dashed #475569',
+              }}
+            />
+
+            {/* Active Arrows */}
+            {configuredPhaseId === 'P1' ? (
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '8px', zIndex: 2 }}>
+                <ArrowDown size={20} color="#10b981" />
+                <ArrowUp size={20} color="#10b981" />
+              </div>
+            ) : (
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', zIndex: 2 }}>
+                <ArrowRight size={20} color="#10b981" />
+                <ArrowLeft size={20} color="#10b981" />
+              </div>
+            )}
+          </div>
+
+          <div style={{ fontSize: '11px', fontWeight: 800, color: '#38bdf8', marginTop: '8px' }}>
+            {configuredPhaseId}: {configuredPhaseId === 'P1' ? 'N-S Flow' : 'E-W Flow'}
           </div>
         </div>
       </div>
@@ -1943,18 +2217,18 @@ export const AdaptiveSignalControl: React.FC = () => {
                   value={selectedScenario}
                   onChange={(e) => setSelectedScenario(e.target.value as any)}
                   style={{
-                    backgroundColor: 'var(--bg-elevated)',
+                    backgroundColor: '#0f172a',
                     border: '1px solid var(--border-subtle)',
                     borderRadius: '6px',
                     padding: '6px 10px',
                     fontSize: '12px',
-                    color: 'var(--text-primary)',
+                    color: '#f8fafc',
                   }}
                 >
-                  <option value="NORMAL_TRAFFIC">Normal Traffic</option>
-                  <option value="HEAVY_TRAFFIC">Heavy Rush Hour</option>
-                  <option value="INCIDENT">Incident / Blockage</option>
-                  <option value="EMERGENCY_VEHICLE">Emergency Corridor</option>
+                  <option value="NORMAL_TRAFFIC" style={{ backgroundColor: '#0f172a', color: '#f8fafc' }}>Normal Traffic</option>
+                  <option value="HEAVY_TRAFFIC" style={{ backgroundColor: '#0f172a', color: '#f8fafc' }}>Heavy Rush Hour</option>
+                  <option value="INCIDENT" style={{ backgroundColor: '#0f172a', color: '#f8fafc' }}>Incident / Blockage</option>
+                  <option value="EMERGENCY_VEHICLE" style={{ backgroundColor: '#0f172a', color: '#f8fafc' }}>Emergency Corridor</option>
                 </select>
 
                 <button
